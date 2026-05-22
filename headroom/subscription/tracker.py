@@ -53,6 +53,33 @@ _PERSIST_FILE_ENV = _paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV
 _DEFAULT_PERSIST_DIR = ".headroom"
 _DEFAULT_PERSIST_FILE = "subscription_state.json"
 
+# PR-G2 (Realignment) — RTK savings wiring.
+#
+# Operators can disable the RTK polling from inside ``update_contribution``
+# without uninstalling the binary or unsetting ``HEADROOM_CONTEXT_TOOL``.
+# Used for diagnostics and for environments where RTK is intentionally
+# excluded from headroom accounting (e.g. shadow tests).
+#
+# Loud / configurable / no silent fallback: unknown values raise loudly via
+# the parser below — they do not silently default to ``enabled``.
+_RTK_WIRING_ENV = "HEADROOM_RTK_WIRING"
+_RTK_WIRING_DEFAULT = "enabled"
+_RTK_WIRING_ALLOWED = ("enabled", "disabled")
+
+
+def _rtk_wiring_mode() -> str:
+    """Return ``enabled`` or ``disabled``. Raises on unknown values.
+
+    Read at call-time so operators can flip the env var without a restart.
+    """
+    raw = os.environ.get(_RTK_WIRING_ENV, "").strip().lower()
+    if not raw:
+        return _RTK_WIRING_DEFAULT
+    if raw in _RTK_WIRING_ALLOWED:
+        return raw
+    raise ValueError(f"Invalid {_RTK_WIRING_ENV}={raw!r}; expected one of {_RTK_WIRING_ALLOWED}")
+
+
 # Singleton on-demand poll floor (seconds): the dashboard may request a fresh
 # poll if the cached snapshot is stale, but we cap how often we will actually
 # hit Anthropic to avoid 429s / OAuth-token flagging. Bounded across users.
@@ -119,6 +146,17 @@ class SubscriptionTracker(QuotaTracker):
         self._state = SubscriptionState()
         self._current_token: str | None = None
         self._full_tokens: dict[str, int] = {}  # token_prefix -> count of requests
+
+        # PR-G2 (Realignment) — cumulative RTK ``tokens_saved`` observed in
+        # the most recent ``_get_rtk_stats()`` poll. Lifetime counter from
+        # the RTK binary (``rtk gain --project``). Used to compute the
+        # per-call delta that feeds ``HeadroomContribution.tokens_saved_rtk``
+        # without double-counting across calls.
+        #
+        # Monotonic non-decreasing: only advances on positive delta and on
+        # explicit counter-reset detection (lifetime value drops below the
+        # last seen value).
+        self._last_rtk_tokens_saved: int = 0
 
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
@@ -194,7 +232,7 @@ class SubscriptionTracker(QuotaTracker):
         tokens_submitted: int = 0,
         tokens_saved_compression: int = 0,
         tokens_saved_cli_filtering: int | None = None,
-        tokens_saved_rtk: int = 0,
+        tokens_saved_rtk: int | None = None,
         tokens_saved_cache_reads: int = 0,
         compression_savings_usd: float = 0.0,
         cache_savings_usd: float = 0.0,
@@ -202,21 +240,133 @@ class SubscriptionTracker(QuotaTracker):
         """Update headroom contribution counters for the current session window.
 
         Called after each proxy request completes with the actual token deltas.
+
+        PR-G2 (Realignment) — ``tokens_saved_rtk`` is now sourced from RTK's
+        own stats endpoint (``rtk gain --format json`` via
+        :func:`headroom.proxy.helpers._get_rtk_stats`) when the caller does
+        not pass an explicit value. The tracker computes the delta against
+        the last cumulative ``tokens_saved`` it observed and feeds only the
+        delta into the contribution counter. Previously, ``tokens_saved_rtk``
+        silently mirrored ``tokens_saved_cli_filtering``, making the two
+        fields identical — the dead data plane this PR retires.
+
+        Args:
+            tokens_saved_rtk: Explicit override for tokens saved by RTK on
+                this call. If ``None`` (the default), the tracker polls RTK
+                stats itself and writes the per-call delta. If passed
+                (including ``0``), the override is used verbatim.
         """
+        # Polled outside the lock so the subprocess call can't deadlock the
+        # event loop or contend with concurrent ``notify_active`` callers.
+        if tokens_saved_rtk is None:
+            tokens_saved_rtk = self._poll_rtk_delta()
+
         with self._lock:
             c = self._state.contribution
-            cli_filtering = (
-                tokens_saved_rtk
-                if tokens_saved_cli_filtering is None
-                else tokens_saved_cli_filtering
-            )
+            # PR-G2: cli_filtering is no longer aliased to the rtk param.
+            # When the caller omits both, both default to 0 — explicit, loud.
+            cli_filtering = tokens_saved_cli_filtering or 0
             c.tokens_submitted += max(tokens_submitted, 0)
             c.tokens_saved_compression += max(tokens_saved_compression, 0)
             c.tokens_saved_cli_filtering += max(cli_filtering, 0)
-            c.tokens_saved_rtk += max(cli_filtering, 0)
+            c.tokens_saved_rtk += max(tokens_saved_rtk, 0)
             c.tokens_saved_cache_reads += max(tokens_saved_cache_reads, 0)
             c.compression_savings_usd += max(compression_savings_usd, 0.0)
             c.cache_savings_usd += max(cache_savings_usd, 0.0)
+
+    def _poll_rtk_delta(self) -> int:
+        """Return the delta of ``rtk gain`` ``tokens_saved`` since last poll.
+
+        Implementation of PR-G2 data-plane wiring. Calls
+        :func:`headroom.proxy.helpers._get_rtk_stats` and reads the lifetime
+        ``tokens_saved`` counter, then diffs against
+        ``self._last_rtk_tokens_saved``.
+
+        Returns ``0`` (never negative) when:
+        - ``HEADROOM_RTK_WIRING=disabled`` — operator opt-out.
+        - ``_get_rtk_stats()`` returns ``None`` — RTK not selected / not
+          installed; explicit zero is the right answer.
+        - ``_get_rtk_stats()`` raises — transient error, logged loudly.
+        - The lifetime counter regressed (RTK reset / new project) — that
+          path also re-baselines ``_last_rtk_tokens_saved`` to the new
+          (smaller) value so subsequent polls return correct deltas.
+
+        Otherwise advances ``self._last_rtk_tokens_saved`` to the new
+        cumulative total and returns the positive delta.
+        """
+        try:
+            wiring_mode = _rtk_wiring_mode()
+        except ValueError as exc:
+            logger.warning(
+                "event=subscription_rtk_wiring_invalid_env error=%s",
+                exc,
+            )
+            return 0
+        if wiring_mode == "disabled":
+            return 0
+
+        try:
+            # Local import keeps the tracker module decoupled from the proxy
+            # helper at import time (helpers.py imports many heavy deps).
+            from headroom.proxy.helpers import _get_rtk_stats
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.warning(
+                "event=subscription_rtk_helper_import_failed error=%s",
+                exc,
+            )
+            return 0
+
+        try:
+            stats = _get_rtk_stats()
+        except Exception as exc:
+            logger.warning(
+                "event=subscription_rtk_stats_fetch_failed error=%s",
+                exc,
+            )
+            return 0
+
+        if stats is None:
+            logger.info(
+                "event=subscription_rtk_stats_unavailable wiring=%s",
+                wiring_mode,
+            )
+            return 0
+
+        # Prefer the lifetime monotonic counter (raw upstream value); fall
+        # back to the unprefixed ``tokens_saved`` only if the lifetime field
+        # is absent — which only happens on the synthetic zero payloads
+        # returned when RTK isn't installed.
+        current_total_raw = stats.get(
+            "lifetime_tokens_saved",
+            stats.get("tokens_saved", 0),
+        )
+        try:
+            current_total = int(current_total_raw or 0)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "event=subscription_rtk_stats_coerce_failed value=%r error=%s",
+                current_total_raw,
+                exc,
+            )
+            return 0
+
+        with self._lock:
+            last = self._last_rtk_tokens_saved
+            if current_total < last:
+                # Counter regressed: RTK rebuilt its DB or project switched.
+                # Re-baseline silently — losing one delta is preferable to
+                # reporting a giant negative number.
+                logger.info(
+                    "event=subscription_rtk_counter_regressed previous=%d current=%d",
+                    last,
+                    current_total,
+                )
+                self._last_rtk_tokens_saved = current_total
+                return 0
+            delta = current_total - last
+            if delta > 0:
+                self._last_rtk_tokens_saved = current_total
+            return delta
 
     # ------------------------------------------------------------------
     # State access
@@ -491,9 +641,20 @@ class SubscriptionTracker(QuotaTracker):
             c.tokens_saved_compression = int(
                 saved.get("proxy_compression", saved.get("compression", 0))
             )
-            cli_filtering = int(saved.get("cli_filtering", saved.get("rtk", 0)))
+            # PR-G2 (Realignment) — prefer the raw counters when present
+            # (new format). For backward compatibility with state written
+            # before PR-G2 we fall back to the dashboard-aliased keys.
+            # Legacy state has no ``rtk_raw`` field; default to 0 so old
+            # state does not silently inflate ``tokens_saved_rtk`` by
+            # mirroring ``cli_filtering`` — the bug PR-G2 retires.
+            cli_filtering = int(
+                saved.get(
+                    "cli_filtering_raw",
+                    saved.get("cli_filtering", saved.get("rtk", 0)),
+                )
+            )
             c.tokens_saved_cli_filtering = cli_filtering
-            c.tokens_saved_rtk = cli_filtering
+            c.tokens_saved_rtk = int(saved.get("rtk_raw", 0))
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})
             c.compression_savings_usd = float(savings_usd.get("compression", 0.0))

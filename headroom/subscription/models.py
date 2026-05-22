@@ -430,6 +430,15 @@ class HeadroomContribution:
                 "proxy_compression": self.tokens_saved_compression,
                 "cli_filtering": self.cli_filtering_saved(),
                 "rtk": self.cli_filtering_saved(),
+                # PR-G2 (Realignment) — raw counters, distinct from the
+                # dashboard-facing ``cli_filtering`` / ``rtk`` keys (which
+                # both report ``max(cli_filtering, rtk)`` for legacy
+                # display). Persisted so the tracker can round-trip each
+                # counter independently — the bug PR-G2 retires is that
+                # ``tokens_saved_rtk`` and ``tokens_saved_cli_filtering``
+                # used to be identical.
+                "cli_filtering_raw": self.tokens_saved_cli_filtering,
+                "rtk_raw": self.tokens_saved_rtk,
                 "cache_reads": self.tokens_saved_cache_reads,
                 "total": self.total_saved(),
             },
