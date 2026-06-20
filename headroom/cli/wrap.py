@@ -123,6 +123,19 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.pi import (
+    PI_SUPPORTED_PROVIDERS as _PI_SUPPORTED_PROVIDERS,
+)
+from headroom.providers.pi import build_pi_launch_args as _build_pi_launch_args
+from headroom.providers.pi import build_pi_launch_env as _build_pi_launch_env
+from headroom.providers.pi import (
+    build_pi_wrap_session_config as _build_pi_wrap_session_config,
+)
+from headroom.providers.pi import render_pi_extension as _render_pi_extension
+from headroom.providers.pi import resolve_managed_providers as _resolve_pi_managed_providers
+from headroom.providers.pi import resolve_pi_binary as _resolve_pi_binary
+from headroom.providers.pi import resolve_provider_ports as _resolve_pi_provider_ports
+from headroom.providers.pi import write_pi_session_config as _write_pi_session_config
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
@@ -5057,6 +5070,64 @@ def openhands(
 
 
 # =============================================================================
+# pi
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option(
+    "--provider",
+    "providers",
+    multiple=True,
+    type=click.Choice(_PI_SUPPORTED_PROVIDERS, case_sensitive=False),
+    help="Managed pi provider (repeatable). Defaults to the full v1 provider set.",
+)
+@click.option(
+    "--port",
+    "-p",
+    default=None,
+    type=int,
+    help="Override the managed proxy port when exactly one provider is selected.",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    providers: tuple[str, ...],
+    port: int | None,
+    verbose: bool,
+    pi_args: tuple[str, ...],
+) -> None:
+    """Launch pi with a session-scoped Headroom extension scaffold."""
+    pi_binary = _resolve_pi_binary()
+    managed_providers = _resolve_pi_managed_providers(providers)
+    provider_ports = _resolve_pi_provider_ports(managed_providers, port)
+
+    with tempfile.TemporaryDirectory(prefix="headroom-wrap-pi-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        session_config = _build_pi_wrap_session_config(managed_providers, provider_ports)
+        session_config_path = _write_pi_session_config(temp_dir, session_config)
+        extension_path = _render_pi_extension(temp_dir, session_config_path)
+        args = _build_pi_launch_args(pi_args, extension_path)
+        env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
+
+        _print_wrap_banner("pi")
+        click.echo()
+        click.echo(
+            " Note: wrap pi is a Phase 0 scaffold; proxy lifecycle and full dynamic "
+            "routing land in later slices."
+        )
+        click.echo(" Launching PI with a temporary Headroom session extension...")
+        if verbose:
+            click.echo(f" HEADROOM_PI_SESSION_CONFIG={session_config_path}")
+            click.echo(f" extension={extension_path}")
+            click.echo(f" managed_providers={', '.join(managed_providers)}")
+            click.echo(f" args: {' '.join(args)}")
+        _print_telemetry_notice()
+        click.echo()
+        result = subprocess.run([pi_binary, *args], env=env)
+        raise SystemExit(result.returncode)
+
+
 # OpenClaw
 # =============================================================================
 
