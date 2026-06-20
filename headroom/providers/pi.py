@@ -239,6 +239,24 @@ def build_pi_launch_env(
     return env
 
 
+def resolve_runtime_provider(
+    runtime_provider: str | None,
+    model_id: str | None,
+) -> tuple[str | None, Literal["runtime-provider", "model-id", "unresolved"]]:
+    """Resolve the current pi provider using runtime data before conservative model-id fallback."""
+
+    normalized_provider = (runtime_provider or "").strip().lower()
+    if normalized_provider:
+        return normalized_provider, "runtime-provider"
+
+    normalized_model_id = (model_id or "").strip().lower()
+    for provider_id in PI_SUPPORTED_PROVIDERS:
+        if normalized_model_id == provider_id or normalized_model_id.startswith(f"{provider_id}/"):
+            return provider_id, "model-id"
+
+    return None, "unresolved"
+
+
 def _has_user_extension_arg(pi_args: Sequence[str]) -> bool:
     for arg in pi_args:
         if arg in {"--extension", "-e"}:
@@ -255,8 +273,8 @@ def build_pi_launch_args(pi_args: Sequence[str], extension_path: Path) -> tuple[
 
     if _has_user_extension_arg(pi_args):
         raise click.ClickException(
-            "User-supplied pi '--extension' arguments are rejected during Phase 0 because "
-            "extension ordering is not proven deterministic yet."
+            "User-supplied pi '--extension' arguments are rejected by `headroom wrap pi` v1 because "
+            "Headroom has not yet proven deterministic extension ordering and conflict handling."
         )
     return (*pi_args, "--extension", str(extension_path))
 
@@ -546,6 +564,12 @@ def _build_phase0_probe_script(
 
         function createOpenAIServer(label) {
           return http.createServer(async (req, res) => {
+            if (req.url === "/health" || req.url === "/readyz" || req.url === "/livez") {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, label }));
+              return;
+            }
+
             const rawBody = await readBody(req);
             const body = JSON.parse(rawBody);
             requests[label].push({ url: req.url, body });
@@ -736,3 +760,411 @@ def _build_phase0_probe_script(
         .replace("__WORK_DIR__", json.dumps(str(work_dir)))
         .replace("__AGENT_DIR__", json.dumps(str(agent_dir)))
     )
+
+
+def run_dynamic_routing_probe(pi_binary: str | None = None) -> dict[str, Any]:
+    """Run a local wrap-pi routing/hysteresis proof against fake endpoints."""
+
+    resolved_pi = pi_binary or resolve_pi_binary()
+    node_binary = shutil.which("node")
+    if not node_binary:
+        raise RuntimeError("node is required to run the pi dynamic routing probe.")
+
+    sdk_index = _derive_pi_sdk_index_path(resolved_pi)
+    with tempfile.TemporaryDirectory(prefix="headroom-pi-dynamic-routing-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        session_config_path = write_pi_session_config(
+            temp_dir,
+            build_pi_wrap_session_config(
+                ["openai", "anthropic"],
+                {"openai": 32111, "anthropic": 32112},
+                health_ttl_ms=50,
+                detach_failures=2,
+                reattach_successes=2,
+                phase0={"forceNativeProviders": []},
+            ),
+        )
+        extension_path = render_pi_extension(temp_dir, session_config_path)
+        results_path = temp_dir / "results.json"
+        log_path = temp_dir / "dynamic-routing-events.jsonl"
+        script_path = temp_dir / "dynamic_routing_probe.mjs"
+
+        session_config = json.loads(session_config_path.read_text(encoding="utf-8"))
+        session_config["phase0"] = {"logPath": str(log_path), "forceNativeProviders": []}
+        session_config_path.write_text(
+            json.dumps(session_config, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        script_path.write_text(
+            _build_dynamic_routing_probe_script(
+                sdk_index_path=sdk_index,
+                session_config_path=session_config_path,
+                extension_path=extension_path,
+                results_path=results_path,
+                work_dir=temp_dir / "workdir",
+                agent_dir=temp_dir / "agentdir",
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env[PI_SESSION_CONFIG_ENV] = str(session_config_path)
+        result = subprocess.run(
+            [node_binary, str(script_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=PI_PHASE0_PROBE_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "pi dynamic routing probe failed:\n"
+                f"STDOUT:\n{result.stdout}\n"
+                f"STDERR:\n{result.stderr}"
+            )
+        return json.loads(results_path.read_text(encoding="utf-8"))
+
+
+
+def _build_dynamic_routing_probe_script(
+    *,
+    sdk_index_path: Path,
+    session_config_path: Path,
+    extension_path: Path,
+    results_path: Path,
+    work_dir: Path,
+    agent_dir: Path,
+) -> str:
+    script = textwrap.dedent(
+        """
+        import http from "node:http";
+        import { once } from "node:events";
+        import { promises as fs } from "node:fs";
+        import process from "node:process";
+
+        const sdk = await import(__SDK_INDEX__);
+        const {
+          AuthStorage,
+          DefaultResourceLoader,
+          ModelRegistry,
+          SessionManager,
+          SettingsManager,
+          createAgentSession,
+        } = sdk;
+
+        const sessionConfigPath = __SESSION_CONFIG_PATH__;
+        const extensionPath = __EXTENSION_PATH__;
+        const resultsPath = __RESULTS_PATH__;
+        const workDir = __WORK_DIR__;
+        const agentDir = __AGENT_DIR__;
+        const logPath = JSON.parse(await fs.readFile(sessionConfigPath, "utf8")).phase0.logPath;
+
+        await fs.mkdir(workDir, { recursive: true });
+        await fs.mkdir(agentDir, { recursive: true });
+        process.env.HEADROOM_PI_SESSION_CONFIG = sessionConfigPath;
+
+        const requests = {
+          nativeOpenai: [],
+          overrideOpenai: [],
+          overrideAnthropic: [],
+        };
+        let openaiHealthy = true;
+
+        async function readBody(req) {
+          const chunks = [];
+          for await (const chunk of req) {
+            chunks.push(Buffer.from(chunk));
+          }
+          return Buffer.concat(chunks).toString("utf8");
+        }
+
+        function createOpenAIServer(label) {
+          return http.createServer(async (req, res) => {
+            if (req.url === "/health" || req.url === "/readyz" || req.url === "/livez") {
+              if (label === "overrideOpenai" && !openaiHealthy) {
+                res.writeHead(503, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, label }));
+                return;
+              }
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, label }));
+              return;
+            }
+
+            const rawBody = await readBody(req);
+            const body = JSON.parse(rawBody);
+            requests[label].push({ url: req.url, body });
+            const model = body.model || `${label}-model`;
+
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.write(
+              "data: " +
+                JSON.stringify({
+                  id: `${label}-1`,
+                  object: "chat.completion.chunk",
+                  created: 0,
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { role: "assistant", content: `${label} response` },
+                      finish_reason: null,
+                    },
+                  ],
+                }) +
+                "\\n\\n",
+            );
+            res.write(
+              "data: " +
+                JSON.stringify({
+                  id: `${label}-1`,
+                  object: "chat.completion.chunk",
+                  created: 0,
+                  model,
+                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+                }) +
+                "\\n\\n",
+            );
+            res.write("data: [DONE]\\n\\n");
+            res.end();
+          });
+        }
+
+        function createAnthropicServer(label) {
+          return http.createServer(async (req, res) => {
+            if (req.url === "/health" || req.url === "/readyz" || req.url === "/livez") {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(JSON.stringify({ ok: true, label }));
+              return;
+            }
+
+            const rawBody = await readBody(req);
+            const body = JSON.parse(rawBody);
+            requests[label].push({ url: req.url, body });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(
+              JSON.stringify({
+                id: `${label}-1`,
+                type: "message",
+                role: "assistant",
+                model: body.model || `${label}-model`,
+                stop_reason: "end_turn",
+                content: [{ type: "text", text: `${label} response` }],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+            );
+          });
+        }
+
+        const nativeOpenaiServer = createOpenAIServer("nativeOpenai");
+        const overrideOpenaiServer = createOpenAIServer("overrideOpenai");
+        const overrideAnthropicServer = createAnthropicServer("overrideAnthropic");
+        nativeOpenaiServer.listen(0, "127.0.0.1");
+        overrideOpenaiServer.listen(0, "127.0.0.1");
+        overrideAnthropicServer.listen(0, "127.0.0.1");
+        await Promise.all([
+          once(nativeOpenaiServer, "listening"),
+          once(overrideOpenaiServer, "listening"),
+          once(overrideAnthropicServer, "listening"),
+        ]);
+
+        const nativeOpenaiPort = nativeOpenaiServer.address().port;
+        const overrideOpenaiPort = overrideOpenaiServer.address().port;
+        const overrideAnthropicPort = overrideAnthropicServer.address().port;
+
+        const authStorage = AuthStorage.create();
+        authStorage.setRuntimeApiKey("openai", "sk-dynamic");
+        authStorage.setRuntimeApiKey("anthropic", "sk-dynamic");
+        authStorage.setRuntimeApiKey("google", "sk-dynamic");
+
+        const modelRegistry = ModelRegistry.inMemory(authStorage);
+        modelRegistry.registerProvider("openai", {
+          baseUrl: `http://127.0.0.1:${nativeOpenaiPort}/v1`,
+          apiKey: "$OPENAI_API_KEY",
+          api: "openai-completions",
+          models: [
+            {
+              id: "openai/probe-openai",
+              name: "Probe OpenAI",
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 128000,
+              maxTokens: 4096,
+            },
+          ],
+        });
+        modelRegistry.registerProvider("anthropic", {
+          baseUrl: "http://127.0.0.1:9",
+          apiKey: "$ANTHROPIC_API_KEY",
+          api: "anthropic-messages",
+          models: [
+            {
+              id: "anthropic/probe-anthropic",
+              name: "Probe Anthropic",
+              reasoning: true,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 200000,
+              maxTokens: 4096,
+            },
+          ],
+        });
+        modelRegistry.registerProvider("google", {
+          baseUrl: `http://127.0.0.1:${nativeOpenaiPort}/v1`,
+          apiKey: "$OPENAI_API_KEY",
+          api: "openai-completions",
+          models: [
+            {
+              id: "google/probe-google",
+              name: "Probe Google",
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 128000,
+              maxTokens: 4096,
+            },
+          ],
+        });
+
+        const config = JSON.parse(await fs.readFile(sessionConfigPath, "utf8"));
+        config.health.ttlMs = 50;
+        config.health.detachFailures = 2;
+        config.health.reattachSuccesses = 2;
+        config.providers.openai.port = overrideOpenaiPort;
+        config.providers.openai.rootUrl = `http://127.0.0.1:${overrideOpenaiPort}`;
+        config.providers.openai.routedBaseUrl = `http://127.0.0.1:${overrideOpenaiPort}/v1`;
+        config.providers.anthropic.port = overrideAnthropicPort;
+        config.providers.anthropic.rootUrl = `http://127.0.0.1:${overrideAnthropicPort}`;
+        config.providers.anthropic.routedBaseUrl = `http://127.0.0.1:${overrideAnthropicPort}`;
+        await fs.writeFile(sessionConfigPath, JSON.stringify(config, null, 2) + "\\n", "utf8");
+
+        const settingsManager = SettingsManager.inMemory({
+          compaction: { enabled: false },
+          retry: { enabled: false },
+        });
+        const loader = new DefaultResourceLoader({
+          cwd: workDir,
+          agentDir,
+          additionalExtensionPaths: [extensionPath],
+          settingsManager,
+        });
+        await loader.reload();
+
+        const openaiModel = modelRegistry.find("openai", "openai/probe-openai");
+        const anthropicModel = modelRegistry.find("anthropic", "anthropic/probe-anthropic");
+        const googleModel = modelRegistry.find("google", "google/probe-google");
+        if (!openaiModel || !anthropicModel || !googleModel) {
+          throw new Error("Failed to register dynamic routing probe models.");
+        }
+
+        const { session } = await createAgentSession({
+          cwd: workDir,
+          agentDir,
+          authStorage,
+          modelRegistry,
+          settingsManager,
+          resourceLoader: loader,
+          model: openaiModel,
+          sessionManager: SessionManager.inMemory(workDir),
+          noTools: "all",
+        });
+
+        function lastAssistantText() {
+          const assistants = session.messages.filter((message) => message.role === "assistant");
+          const latest = assistants[assistants.length - 1];
+          if (!latest) {
+            return null;
+          }
+          return latest.content
+            .filter((block) => block.type === "text")
+            .map((block) => block.text)
+            .join("");
+        }
+
+        async function waitForTtl() {
+          await new Promise((resolve) => setTimeout(resolve, 70));
+        }
+
+        try {
+          await session.prompt("Use the managed OpenAI route.");
+          const firstResponse = lastAssistantText();
+
+          openaiHealthy = false;
+          await waitForTtl();
+          await session.prompt("Stay on the suspect route.");
+          const suspectResponse = lastAssistantText();
+
+          await waitForTtl();
+          await session.setModel(anthropicModel);
+          await session.setModel(openaiModel);
+          await session.prompt("Fall back once the proxy becomes unavailable.");
+          const unavailableResponse = lastAssistantText();
+
+          openaiHealthy = true;
+          await waitForTtl();
+          await session.setModel(anthropicModel);
+          await session.setModel(openaiModel);
+          await session.prompt("Stay native until the reattach threshold is met.");
+          const recoveryHoldResponse = lastAssistantText();
+
+          await waitForTtl();
+          await session.setModel(anthropicModel);
+          await session.setModel(openaiModel);
+          await session.prompt("Prime the route after the reattach threshold is met.");
+          const reattachPrimeResponse = lastAssistantText();
+          await session.setModel(anthropicModel);
+          await session.setModel(openaiModel);
+          await session.prompt("Reattach after repeated health successes.");
+          const recoveredResponse = lastAssistantText();
+
+          await session.setModel(googleModel);
+
+          const events = (await fs.readFile(logPath, "utf8"))
+            .trim()
+            .split("\\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line));
+
+          await fs.writeFile(
+            resultsPath,
+            JSON.stringify(
+              {
+                firstResponse,
+                suspectResponse,
+                unavailableResponse,
+                recoveryHoldResponse,
+                reattachPrimeResponse,
+                recoveredResponse,
+                requests,
+                events,
+                nativeOpenaiPort,
+                overrideOpenaiPort,
+                overrideAnthropicPort,
+              },
+              null,
+              2,
+            ) + "\\n",
+            "utf8",
+          );
+        } finally {
+          session.dispose();
+          await Promise.all([
+            new Promise((resolve) => nativeOpenaiServer.close(resolve)),
+            new Promise((resolve) => overrideOpenaiServer.close(resolve)),
+            new Promise((resolve) => overrideAnthropicServer.close(resolve)),
+          ]);
+        }
+        """
+    )
+    return (
+        script.replace("__SDK_INDEX__", json.dumps(sdk_index_path.as_uri()))
+        .replace("__SESSION_CONFIG_PATH__", json.dumps(str(session_config_path)))
+        .replace("__EXTENSION_PATH__", json.dumps(str(extension_path)))
+        .replace("__RESULTS_PATH__", json.dumps(str(results_path)))
+        .replace("__WORK_DIR__", json.dumps(str(work_dir)))
+        .replace("__AGENT_DIR__", json.dumps(str(agent_dir)))
+    )
+

@@ -220,4 +220,84 @@ def test_run_phase0_feasibility_probe_hits_override_then_native_fallback() -> No
     assert registered[0]["baseUrl"] == f"http://127.0.0.1:{result['overridePort']}/v1"
 
     unregistered = [event for event in result["events"] if event["type"] == "provider_unregistered"]
-    assert any(event["reason"] == "forced-native" for event in unregistered)
+    assert any("forced-native" in event["reason"] for event in unregistered)
+
+
+def test_resolve_runtime_provider_prefers_runtime_provider() -> None:
+    assert pi_mod.resolve_runtime_provider("github-copilot", "openai/gpt-5") == (
+        "github-copilot",
+        "runtime-provider",
+    )
+
+
+def test_resolve_runtime_provider_falls_back_to_supported_model_prefix() -> None:
+    assert pi_mod.resolve_runtime_provider(None, "anthropic/claude-sonnet") == (
+        "anthropic",
+        "model-id",
+    )
+
+
+def test_resolve_runtime_provider_leaves_unknown_models_unmanaged() -> None:
+    assert pi_mod.resolve_runtime_provider(None, "google/gemini-2.5-pro") == (
+        None,
+        "unresolved",
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("pi") is None or shutil.which("node") is None,
+    reason="pi and node are required for the live dynamic routing probe",
+)
+def test_run_dynamic_routing_probe_proves_hysteresis_and_family_routing() -> None:
+    result = pi_mod.run_dynamic_routing_probe()
+
+    assert result["firstResponse"] == "overrideOpenai response"
+    assert result["suspectResponse"] == "overrideOpenai response"
+    assert result["unavailableResponse"] == "nativeOpenai response"
+    assert result["recoveryHoldResponse"] == "nativeOpenai response"
+    assert result["reattachPrimeResponse"] == "nativeOpenai response"
+
+    assert [request["url"] for request in result["requests"]["overrideOpenai"]] == [
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+    ]
+    assert [request["url"] for request in result["requests"]["nativeOpenai"]] == [
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+    ]
+
+    registered = [event for event in result["events"] if event["type"] == "provider_registered"]
+    openai_registrations = [event for event in registered if event["providerId"] == "openai"]
+    registered_pairs = {(event["providerId"], event["baseUrl"]) for event in registered}
+    assert ("openai", f"http://127.0.0.1:{result['overrideOpenaiPort']}/v1") in registered_pairs
+    assert ("anthropic", f"http://127.0.0.1:{result['overrideAnthropicPort']}") in registered_pairs
+    assert len(openai_registrations) >= 2
+    assert openai_registrations[-1]["healthStatus"] == "healthy"
+
+    observed = [event for event in result["events"] if event["type"] == "provider_observed"]
+    assert any(
+        event["resolvedProvider"] == "google"
+        and event["resolutionSource"] == "runtime-provider"
+        for event in observed
+    )
+
+    health_checks = [
+        event for event in result["events"]
+        if event["type"] == "provider_health_checked" and event["providerId"] == "openai"
+    ]
+    assert len(health_checks) == 5
+
+    transitions = [
+        (event["previousStatus"], event["status"])
+        for event in result["events"]
+        if event["type"] == "provider_health_transition" and event["providerId"] == "openai"
+    ]
+    assert ("healthy", "suspect") in transitions
+    assert ("suspect", "unavailable") in transitions
+    assert ("unavailable", "healthy") in transitions
+
+    unregistered = [event for event in result["events"] if event["type"] == "provider_unregistered"]
+    assert any(event["providerId"] == "openai" for event in unregistered)
+

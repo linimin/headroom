@@ -219,7 +219,7 @@ def test_wrap_pi_rejects_user_supplied_extension_passthrough_before_proxy_start(
         result = runner.invoke(main, ["wrap", "pi", "--", "--extension", "/tmp/user.ts"])
 
     assert result.exit_code != 0
-    assert "User-supplied pi '--extension' arguments are rejected during Phase 0" in result.output
+    assert "User-supplied pi '--extension' arguments are rejected by `headroom wrap pi` v1" in result.output
     start_proxies.assert_not_called()
 
 
