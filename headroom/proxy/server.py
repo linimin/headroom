@@ -2323,6 +2323,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             }
         return payload
 
+    def _headroom_meta_payload() -> dict[str, Any]:
+        upstream_family = os.environ.get("HEADROOM_PROXY_WRAP_PI_UPSTREAM_FAMILY") or "unknown"
+        attach_compatible = (
+            os.environ.get("HEADROOM_PROXY_WRAP_PI_ATTACH_CAPABLE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        wrap_pi = attach_compatible and upstream_family != "unknown"
+        return {
+            "headroomVersion": __version__,
+            "backend": config.backend,
+            "upstreamFamily": upstream_family,
+            "memory": config.memory_enabled,
+            "capabilities": {
+                "attachCompatible": wrap_pi,
+                "wrapPi": wrap_pi,
+            },
+        }
+
     # ---------------------------------------------------------------------------
     # Upstream connectivity check — cached to avoid hammering the upstream on
     # every /readyz poll.  Set HEADROOM_SKIP_UPSTREAM_CHECK=1 to opt out (e.g.
@@ -2644,6 +2662,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # remain the unauthenticated probes for orchestration health.
         payload = _health_payload(include_config=_request_is_loopback(request))
         return JSONResponse(status_code=200, content=payload)
+
+    @app.get("/headroom/meta")
+    async def headroom_meta():
+        return JSONResponse(status_code=200, content=_headroom_meta_payload())
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
     # debug endpoints are invisible to external scanners.

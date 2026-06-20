@@ -29,9 +29,10 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 from headroom._subprocess import run
 
@@ -129,11 +130,16 @@ from headroom.providers.pi import (
 from headroom.providers.pi import build_pi_launch_args as _build_pi_launch_args
 from headroom.providers.pi import build_pi_launch_env as _build_pi_launch_env
 from headroom.providers.pi import (
+    build_pi_proxy_metadata_env as _build_pi_proxy_metadata_env,
+)
+from headroom.providers.pi import (
     build_pi_wrap_session_config as _build_pi_wrap_session_config,
 )
+from headroom.providers.pi import probe_attach_compatibility as _probe_pi_attach_compatibility
 from headroom.providers.pi import render_pi_extension as _render_pi_extension
 from headroom.providers.pi import resolve_managed_providers as _resolve_pi_managed_providers
 from headroom.providers.pi import resolve_pi_binary as _resolve_pi_binary
+from headroom.providers.pi import resolve_pi_proxy_backend as _resolve_pi_proxy_backend
 from headroom.providers.pi import resolve_provider_ports as _resolve_pi_provider_ports
 from headroom.providers.pi import write_pi_session_config as _write_pi_session_config
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
@@ -402,6 +408,7 @@ def _start_proxy(
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
+    extra_env: Mapping[str, str] | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -474,6 +481,8 @@ def _start_proxy(
         proxy_env["GITHUB_COPILOT_API_TOKEN"] = copilot_api_token
         if openai_api_url:
             proxy_env["GITHUB_COPILOT_API_URL"] = openai_api_url
+    if extra_env:
+        proxy_env.update(extra_env)
 
     proc = subprocess.Popen(
         cmd,
@@ -5074,6 +5083,163 @@ def openhands(
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class _PiManagedProxy:
+    provider_id: str
+    port: int
+    ownership: Literal["owned", "attached"]
+    process: subprocess.Popen[Any] | None = None
+
+
+def _pi_process_group_signal(proc: subprocess.Popen[Any], signum: int) -> None:
+    """Signal a child process or its process group when possible."""
+
+    if proc.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signum)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+    proc.send_signal(signum)
+
+
+def _cleanup_pi_wrap_session(
+    pi_process: subprocess.Popen[Any] | None,
+    proxies: Sequence[_PiManagedProxy],
+    *,
+    forwarded_signal: int | None = None,
+) -> None:
+    """Tear down the pi child first, then only wrapper-owned proxies."""
+
+    if pi_process is not None and pi_process.poll() is None:
+        pi_signal = forwarded_signal or signal.SIGTERM
+        _pi_process_group_signal(pi_process, pi_signal)
+        try:
+            pi_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _pi_process_group_signal(pi_process, kill_signal)
+            try:
+                pi_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    for proxy in proxies:
+        if proxy.ownership != "owned" or proxy.process is None or proxy.process.poll() is not None:
+            continue
+        _pi_process_group_signal(proxy.process, signal.SIGTERM)
+
+    for proxy in proxies:
+        if proxy.ownership != "owned" or proxy.process is None or proxy.process.poll() is not None:
+            continue
+        try:
+            proxy.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            _pi_process_group_signal(proxy.process, kill_signal)
+            try:
+                proxy.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def _start_or_attach_pi_proxy(
+    provider_id: str,
+    port: int,
+    *,
+    backend: str | None,
+    memory: bool,
+    verbose: bool,
+) -> _PiManagedProxy:
+    """Return proxy ownership state for one managed pi provider."""
+
+    attach_probe = _probe_pi_attach_compatibility(
+        provider_id,
+        port,
+        backend=backend,
+        memory=memory,
+    )
+    if attach_probe.status == "compatible":
+        click.echo(f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}")
+        if verbose and attach_probe.metadata is not None:
+            click.echo(
+                "   attach metadata: "
+                f"version={attach_probe.metadata.headroom_version} "
+                f"backend={attach_probe.metadata.backend} "
+                f"family={attach_probe.metadata.upstream_family} "
+                f"memory={attach_probe.metadata.memory}"
+            )
+        return _PiManagedProxy(
+            provider_id=provider_id,
+            port=port,
+            ownership="attached",
+            process=None,
+        )
+
+    bind_error = _port_bind_error(port)
+    if bind_error is not None:
+        if attach_probe.status == "incompatible":
+            raise click.ClickException(
+                f"Cannot attach pi provider {provider_id!r} on port {port}: {attach_probe.reason}"
+            )
+        raise click.ClickException(
+            f"Port {port} is already in use for pi provider {provider_id!r}, but attach compatibility "
+            f"could not be proven via /headroom/meta. Stop the existing process or choose a different port."
+        )
+
+    click.echo(f" Starting Headroom proxy for {provider_id} on port {port}...")
+    proc = cast(
+        subprocess.Popen[Any],
+        _start_proxy(
+            port,
+            memory=memory,
+            agent_type="pi",
+            backend=backend,
+            extra_env=_build_pi_proxy_metadata_env(provider_id),
+        ),
+    )
+    if verbose:
+        click.echo(f"   ownership=owned backend={backend}")
+    return _PiManagedProxy(
+        provider_id=provider_id,
+        port=port,
+        ownership="owned",
+        process=proc,
+    )
+
+
+def _start_pi_managed_proxies(
+    managed_providers: Sequence[str],
+    provider_ports: Mapping[str, int],
+    *,
+    backend: str | None,
+    memory: bool,
+    verbose: bool,
+) -> list[_PiManagedProxy]:
+    """Start or attach all proxies needed for one wrap-pi session."""
+
+    proxies: list[_PiManagedProxy] = []
+    try:
+        for provider_id in managed_providers:
+            proxies.append(
+                _start_or_attach_pi_proxy(
+                    provider_id,
+                    provider_ports[provider_id],
+                    backend=backend,
+                    memory=memory,
+                    verbose=verbose,
+                )
+            )
+    except Exception:
+        _cleanup_pi_wrap_session(None, proxies)
+        raise
+    return proxies
+
+
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option(
     "--provider",
@@ -5089,44 +5255,99 @@ def openhands(
     type=int,
     help="Override the managed proxy port when exactly one provider is selected.",
 )
+@click.option(
+    "--backend",
+    default=None,
+    help="Backend applied uniformly to wrapper-owned pi proxies.",
+)
+@click.option(
+    "--memory",
+    is_flag=True,
+    help="Enable memory uniformly for wrapper-owned pi proxies.",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
 def pi(
     providers: tuple[str, ...],
     port: int | None,
+    backend: str | None,
+    memory: bool,
     verbose: bool,
     pi_args: tuple[str, ...],
 ) -> None:
-    """Launch pi with a session-scoped Headroom extension scaffold."""
+    """Launch pi with a session-scoped Headroom extension and managed proxy lifecycle."""
+
     pi_binary = _resolve_pi_binary()
     managed_providers = _resolve_pi_managed_providers(providers)
     provider_ports = _resolve_pi_provider_ports(managed_providers, port)
+    resolved_backend = _resolve_pi_proxy_backend(backend)
+    proxies: list[_PiManagedProxy] = []
+    pi_process: subprocess.Popen[Any] | None = None
+    cleaned = False
 
-    with tempfile.TemporaryDirectory(prefix="headroom-wrap-pi-") as temp_dir_str:
-        temp_dir = Path(temp_dir_str)
-        session_config = _build_pi_wrap_session_config(managed_providers, provider_ports)
-        session_config_path = _write_pi_session_config(temp_dir, session_config)
-        extension_path = _render_pi_extension(temp_dir, session_config_path)
-        args = _build_pi_launch_args(pi_args, extension_path)
-        env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
-
-        _print_wrap_banner("pi")
-        click.echo()
-        click.echo(
-            " Note: wrap pi is a Phase 0 scaffold; proxy lifecycle and full dynamic "
-            "routing land in later slices."
+    def cleanup(*, forwarded_signal: int | None = None) -> None:
+        nonlocal cleaned
+        if cleaned:
+            return
+        cleaned = True
+        _cleanup_pi_wrap_session(
+            pi_process,
+            proxies,
+            forwarded_signal=forwarded_signal,
         )
-        click.echo(" Launching PI with a temporary Headroom session extension...")
-        if verbose:
-            click.echo(f" HEADROOM_PI_SESSION_CONFIG={session_config_path}")
-            click.echo(f" extension={extension_path}")
-            click.echo(f" managed_providers={', '.join(managed_providers)}")
-            click.echo(f" args: {' '.join(args)}")
-        _print_telemetry_notice()
-        click.echo()
-        result = subprocess.run([pi_binary, *args], env=env)
-        raise SystemExit(result.returncode)
 
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        cleanup(forwarded_signal=signum)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    try:
+        with tempfile.TemporaryDirectory(prefix="headroom-wrap-pi-") as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
+            extension_path = _render_pi_extension(temp_dir, temp_dir / "session.json")
+            args = _build_pi_launch_args(pi_args, extension_path)
+
+            proxies = _start_pi_managed_proxies(
+                managed_providers,
+                provider_ports,
+                backend=resolved_backend,
+                memory=memory,
+                verbose=verbose,
+            )
+
+            session_config = _build_pi_wrap_session_config(managed_providers, provider_ports)
+            for proxy in proxies:
+                session_config["providers"][proxy.provider_id]["ownership"] = proxy.ownership
+            session_config_path = _write_pi_session_config(temp_dir, session_config)
+            env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
+
+            _print_wrap_banner("pi")
+            click.echo()
+            click.echo(" Launching PI with temporary Headroom extension and managed proxy lifecycle...")
+            if verbose:
+                click.echo(f" HEADROOM_PI_SESSION_CONFIG={session_config_path}")
+                click.echo(f" extension={extension_path}")
+                click.echo(f" managed_providers={', '.join(managed_providers)}")
+                click.echo(f" backend={resolved_backend}")
+                click.echo(f" memory={memory}")
+                click.echo(f" args: {' '.join(args)}")
+            _print_telemetry_notice()
+            click.echo()
+
+            pi_process = subprocess.Popen(
+                [pi_binary, *args],
+                env=env,
+                start_new_session=os.name == "posix",
+            )
+            raise SystemExit(pi_process.wait())
+    finally:
+        cleanup()
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 # OpenClaw
 # =============================================================================

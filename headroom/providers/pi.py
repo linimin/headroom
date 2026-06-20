@@ -8,15 +8,22 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import click
 
+from headroom._version import __version__
+
 PI_SESSION_CONFIG_ENV = "HEADROOM_PI_SESSION_CONFIG"
 PI_VERBOSE_ENV = "HEADROOM_PI_VERBOSE"
+PI_ATTACH_METADATA_PATH = "/headroom/meta"
+PI_PROXY_METADATA_FAMILY_ENV = "HEADROOM_PROXY_WRAP_PI_UPSTREAM_FAMILY"
+PI_PROXY_METADATA_CAPABILITY_ENV = "HEADROOM_PROXY_WRAP_PI_ATTACH_CAPABLE"
 PI_SUPPORTED_PROVIDERS = ("openai", "anthropic", "github-copilot")
 PI_DEFAULT_PROVIDER_ORDER = PI_SUPPORTED_PROVIDERS
 PI_PHASE0_PROBE_TIMEOUT_SECONDS = 60
@@ -40,9 +47,31 @@ class PiProviderSpec:
         return f"{self.root_url(port)}{self.routed_suffix}"
 
 
+@dataclass(frozen=True)
+class PiAttachMetadata:
+    """Structured compatibility metadata advertised by a proxy for wrap-pi attach mode."""
+
+    headroom_version: str
+    backend: str
+    upstream_family: str
+    memory: bool
+    attach_compatible: bool
+    wrap_pi: bool
+
+
+@dataclass(frozen=True)
+class PiAttachProbeResult:
+    """Result of checking whether wrap-pi may attach to a proxy already bound on a port."""
+
+    status: Literal["missing", "compatible", "incompatible"]
+    provider_id: str
+    port: int
+    reason: str
+    metadata: PiAttachMetadata | None = None
+
 
 def managed_provider_specs() -> dict[str, PiProviderSpec]:
-    """Return the Phase 0 supported pi provider specs."""
+    """Return Phase 0 supported pi provider specs."""
 
     return {
         "openai": PiProviderSpec(
@@ -66,22 +95,29 @@ def managed_provider_specs() -> dict[str, PiProviderSpec]:
     }
 
 
-
 def default_provider_ports() -> dict[str, int]:
     """Return canonical default proxy ports for `wrap pi`."""
 
-    return {provider_id: spec.default_port for provider_id, spec in managed_provider_specs().items()}
-
+    return {
+        provider_id: spec.default_port
+        for provider_id, spec in managed_provider_specs().items()
+    }
 
 
 def resolve_pi_binary(which: Any = shutil.which) -> str:
-    """Resolve the `pi` executable or raise an actionable error."""
+    """Resolve the installed `pi` executable path."""
 
-    pi_binary = which("pi")
-    if pi_binary:
-        return pi_binary
-    raise click.ClickException("'pi' not found in PATH. Install pi or set it on your PATH.")
+    resolved = which("pi")
+    if not resolved:
+        raise click.ClickException("Could not find `pi` on PATH.")
+    return resolved
 
+
+def resolve_pi_proxy_backend(backend: str | None) -> str:
+    """Resolve the backend a wrap-pi invocation expects for managed proxies."""
+
+    value = (backend or os.environ.get("HEADROOM_BACKEND") or "anthropic").strip()
+    return value or "anthropic"
 
 
 def resolve_managed_providers(providers: Sequence[str]) -> list[str]:
@@ -108,7 +144,6 @@ def resolve_managed_providers(providers: Sequence[str]) -> list[str]:
     return resolved
 
 
-
 def resolve_provider_ports(
     managed_providers: Sequence[str],
     port_override: int | None,
@@ -122,7 +157,6 @@ def resolve_provider_ports(
         raise click.ClickException("'--port' is only valid when exactly one pi provider is managed.")
     provider_id = managed_providers[0]
     return {provider_id: port_override}
-
 
 
 def build_pi_wrap_session_config(
@@ -170,18 +204,16 @@ def build_pi_wrap_session_config(
     return payload
 
 
-
 def write_pi_session_config(temp_dir: Path, session_config: Mapping[str, Any]) -> Path:
-    """Write the session config JSON into the temporary pi workspace."""
+    """Write the session config JSON into a temporary pi workspace."""
 
     path = temp_dir / "session.json"
     path.write_text(json.dumps(dict(session_config), indent=2) + "\n", encoding="utf-8")
     return path
 
 
-
 def render_pi_extension(temp_dir: Path, session_config_path: Path) -> Path:
-    """Materialize the checked-in pi extension template into the temp workspace."""
+    """Materialize the checked-in pi extension template into a temp workspace."""
 
     del session_config_path  # The extension reads the path from HEADROOM_PI_SESSION_CONFIG.
     source = Path(__file__).with_name("pi_extension_template.ts")
@@ -190,14 +222,13 @@ def render_pi_extension(temp_dir: Path, session_config_path: Path) -> Path:
     return target
 
 
-
 def build_pi_launch_env(
     base_env: Mapping[str, str],
     session_config_path: Path,
     *,
     verbose: bool,
 ) -> dict[str, str]:
-    """Build the child environment for a pi session-scoped extension launch."""
+    """Build the environment for a pi session-scoped extension launch."""
 
     env = dict(base_env)
     env[PI_SESSION_CONFIG_ENV] = str(session_config_path)
@@ -206,7 +237,6 @@ def build_pi_launch_env(
     else:
         env.pop(PI_VERBOSE_ENV, None)
     return env
-
 
 
 def _has_user_extension_arg(pi_args: Sequence[str]) -> bool:
@@ -220,17 +250,177 @@ def _has_user_extension_arg(pi_args: Sequence[str]) -> bool:
     return False
 
 
-
 def build_pi_launch_args(pi_args: Sequence[str], extension_path: Path) -> tuple[str, ...]:
     """Append exactly one Headroom-managed `--extension` flag to pi args."""
 
     if _has_user_extension_arg(pi_args):
         raise click.ClickException(
             "User-supplied pi '--extension' arguments are rejected during Phase 0 because "
-            "extension ordering has not been proven deterministic yet."
+            "extension ordering is not proven deterministic yet."
         )
     return (*pi_args, "--extension", str(extension_path))
 
+
+def build_pi_proxy_metadata_env(provider_id: str) -> dict[str, str]:
+    """Return proxy env vars needed for wrap-pi attach metadata."""
+
+    spec = managed_provider_specs()[provider_id]
+    return {
+        PI_PROXY_METADATA_FAMILY_ENV: spec.family,
+        PI_PROXY_METADATA_CAPABILITY_ENV: "1",
+    }
+
+
+def _coerce_metadata_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _read_attach_metadata_payload(
+    port: int,
+    *,
+    urlopen: Any = urllib.request.urlopen,
+) -> tuple[bool, object | None]:
+    """Return whether the metadata endpoint was reachable plus the decoded payload."""
+
+    url = f"http://127.0.0.1:{port}{PI_ATTACH_METADATA_PATH}"
+    try:
+        with urlopen(url, timeout=2) as response:
+            raw = response.read().decode("utf-8")
+    except (OSError, urllib.error.URLError):
+        return False, None
+    try:
+        return True, json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return True, None
+
+
+def _parse_attach_metadata(payload: object) -> PiAttachMetadata | None:
+    if not isinstance(payload, dict):
+        return None
+    headroom_version = payload.get("headroomVersion")
+    backend = payload.get("backend")
+    upstream_family = payload.get("upstreamFamily")
+    memory = payload.get("memory")
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return None
+    attach_compatible = _coerce_metadata_bool(capabilities.get("attachCompatible"))
+    wrap_pi = _coerce_metadata_bool(capabilities.get("wrapPi"))
+    if not isinstance(headroom_version, str) or not headroom_version:
+        return None
+    if not isinstance(backend, str) or not backend:
+        return None
+    if not isinstance(upstream_family, str) or not upstream_family:
+        return None
+    if not isinstance(memory, bool):
+        return None
+    if attach_compatible is None or wrap_pi is None:
+        return None
+    return PiAttachMetadata(
+        headroom_version=headroom_version,
+        backend=backend,
+        upstream_family=upstream_family,
+        memory=memory,
+        attach_compatible=attach_compatible,
+        wrap_pi=wrap_pi,
+    )
+
+
+def probe_attach_compatibility(
+    provider_id: str,
+    port: int,
+    *,
+    backend: str | None,
+    memory: bool,
+    urlopen: Any = urllib.request.urlopen,
+) -> PiAttachProbeResult:
+    """Validate whether wrap-pi may attach to a proxy already listening on a port."""
+
+    reachable, payload = _read_attach_metadata_payload(port, urlopen=urlopen)
+    if not reachable:
+        return PiAttachProbeResult(
+            status="missing",
+            provider_id=provider_id,
+            port=port,
+            reason=f"No {PI_ATTACH_METADATA_PATH} endpoint responded on port {port}.",
+        )
+
+    metadata = _parse_attach_metadata(payload)
+    if metadata is None:
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=f"Metadata endpoint on port {port} returned an invalid payload.",
+        )
+
+    expected_backend = resolve_pi_proxy_backend(backend)
+    expected_family = managed_provider_specs()[provider_id].family
+    if not metadata.attach_compatible or not metadata.wrap_pi:
+        reason = f"Metadata on port {port} does not advertise wrap-pi attach compatibility."
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=reason,
+            metadata=metadata,
+        )
+    if metadata.headroom_version != __version__:
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=(
+                f"Metadata on port {port} reports Headroom {metadata.headroom_version}, "
+                f"but wrap pi requires {__version__}."
+            ),
+            metadata=metadata,
+        )
+    if metadata.backend != expected_backend:
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=(
+                f"Metadata on port {port} reports backend {metadata.backend!r}, "
+                f"expected {expected_backend!r}."
+            ),
+            metadata=metadata,
+        )
+    if metadata.upstream_family != expected_family:
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=(
+                f"Metadata on port {port} reports upstream family {metadata.upstream_family!r}, "
+                f"expected {expected_family!r} for provider {provider_id!r}."
+            ),
+            metadata=metadata,
+        )
+    if metadata.memory != memory:
+        return PiAttachProbeResult(
+            status="incompatible",
+            provider_id=provider_id,
+            port=port,
+            reason=(
+                f"Metadata on port {port} reports memory={metadata.memory!r}, "
+                f"expected {memory!r}."
+            ),
+            metadata=metadata,
+        )
+    return PiAttachProbeResult(
+        status="compatible",
+        provider_id=provider_id,
+        port=port,
+        reason=(
+            f"Existing proxy on port {port} matches backend={expected_backend!r}, "
+            f"family={expected_family!r}, memory={memory!r}."
+        ),
+        metadata=metadata,
+    )
 
 
 def _derive_pi_sdk_index_path(pi_binary: str) -> Path:

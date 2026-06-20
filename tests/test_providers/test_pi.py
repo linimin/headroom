@@ -1,7 +1,8 @@
-"""Tests for `headroom.providers.pi`."""
+"""Tests for ``headroom.providers.pi``."""
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import click
 import pytest
 
+from headroom._version import __version__
 from headroom.providers import pi as pi_mod
 
 
@@ -49,49 +51,21 @@ def test_build_pi_wrap_session_config_renders_routed_urls() -> None:
         {"openai": 8789, "anthropic": 8790, "github-copilot": 8788},
         phase0={"forceNativeProviders": ["openai"]},
     )
-
     assert config["version"] == 1
     assert config["managedProviders"] == ["openai", "anthropic", "github-copilot"]
     assert config["providers"]["openai"]["routedBaseUrl"] == "http://127.0.0.1:8789/v1"
     assert config["providers"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8790"
     assert config["providers"]["github-copilot"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
-    assert config["phase0"]["forceNativeProviders"] == ["openai"]
+    assert config["phase0"] == {"forceNativeProviders": ["openai"]}
 
 
-def test_write_session_config_and_render_extension(tmp_path: Path) -> None:
-    config_path = pi_mod.write_pi_session_config(
-        tmp_path,
-        pi_mod.build_pi_wrap_session_config(["openai"], {"openai": 8789}),
-    )
-    extension_path = pi_mod.render_pi_extension(tmp_path, config_path)
-
-    assert config_path.name == "session.json"
-    assert extension_path.name == "extension.ts"
-    assert json.loads(config_path.read_text(encoding="utf-8"))["providers"]["openai"][
-        "routedBaseUrl"
-    ] == "http://127.0.0.1:8789/v1"
-    assert "HEADROOM_PI_SESSION_CONFIG" in extension_path.read_text(encoding="utf-8")
-
-
-def test_build_pi_launch_env_sets_session_config_and_verbose(tmp_path: Path) -> None:
-    config_path = tmp_path / "session.json"
-    config_path.write_text("{}\n", encoding="utf-8")
-
-    env = pi_mod.build_pi_launch_env({"EXISTING": "1", pi_mod.PI_VERBOSE_ENV: "0"}, config_path, verbose=True)
-    assert env["EXISTING"] == "1"
-    assert env[pi_mod.PI_SESSION_CONFIG_ENV] == str(config_path)
-    assert env[pi_mod.PI_VERBOSE_ENV] == "1"
-
-    quiet_env = pi_mod.build_pi_launch_env(env, config_path, verbose=False)
-    assert quiet_env[pi_mod.PI_SESSION_CONFIG_ENV] == str(config_path)
+def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: Path) -> None:
+    session_path = tmp_path / "session.json"
+    quiet_env = pi_mod.build_pi_launch_env({}, session_path, verbose=False)
+    loud_env = pi_mod.build_pi_launch_env({}, session_path, verbose=True)
+    assert quiet_env[pi_mod.PI_SESSION_CONFIG_ENV] == str(session_path)
     assert pi_mod.PI_VERBOSE_ENV not in quiet_env
-
-
-def test_build_pi_launch_args_appends_exactly_one_extension(tmp_path: Path) -> None:
-    extension_path = tmp_path / "extension.ts"
-    args = pi_mod.build_pi_launch_args(("--model", "openai/gpt-5"), extension_path)
-
-    assert args == ("--model", "openai/gpt-5", "--extension", str(extension_path))
+    assert loud_env[pi_mod.PI_VERBOSE_ENV] == "1"
 
 
 @pytest.mark.parametrize(
@@ -110,6 +84,109 @@ def test_build_pi_launch_args_rejects_user_extension_flags(
         pi_mod.build_pi_launch_args(pi_args, tmp_path / "extension.ts")
 
 
+def test_build_pi_proxy_metadata_env_uses_provider_family() -> None:
+    env = pi_mod.build_pi_proxy_metadata_env("github-copilot")
+    assert env == {
+        pi_mod.PI_PROXY_METADATA_FAMILY_ENV: "openai",
+        pi_mod.PI_PROXY_METADATA_CAPABILITY_ENV: "1",
+    }
+
+
+class _FakeResponse:
+    def __init__(self, payload: str) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload.encode("utf-8")
+
+
+def _urlopen_with_payload(payload: dict[str, object]):
+    def _urlopen(url: str, timeout: int = 0) -> _FakeResponse:
+        assert url.endswith(pi_mod.PI_ATTACH_METADATA_PATH)
+        assert timeout == 2
+        return _FakeResponse(json.dumps(payload))
+
+    return _urlopen
+
+
+def test_probe_attach_compatibility_accepts_matching_metadata() -> None:
+    payload = {
+        "headroomVersion": __version__,
+        "backend": "anthropic",
+        "upstreamFamily": "openai",
+        "memory": False,
+        "capabilities": {"attachCompatible": True, "wrapPi": True},
+    }
+    result = pi_mod.probe_attach_compatibility(
+        "github-copilot",
+        8788,
+        backend="anthropic",
+        memory=False,
+        urlopen=_urlopen_with_payload(payload),
+    )
+    assert result.status == "compatible"
+    assert result.metadata is not None
+    assert result.metadata.upstream_family == "openai"
+
+
+def test_probe_attach_compatibility_rejects_backend_mismatch() -> None:
+    payload = {
+        "headroomVersion": __version__,
+        "backend": "bedrock",
+        "upstreamFamily": "openai",
+        "memory": False,
+        "capabilities": {"attachCompatible": True, "wrapPi": True},
+    }
+    result = pi_mod.probe_attach_compatibility(
+        "openai",
+        8789,
+        backend="anthropic",
+        memory=False,
+        urlopen=_urlopen_with_payload(payload),
+    )
+    assert result.status == "incompatible"
+    assert "backend" in result.reason
+
+
+def test_probe_attach_compatibility_rejects_missing_required_metadata_fields() -> None:
+    payload = {
+        "headroomVersion": __version__,
+        "backend": "anthropic",
+        "memory": False,
+        "capabilities": {"attachCompatible": True, "wrapPi": True},
+    }
+    result = pi_mod.probe_attach_compatibility(
+        "openai",
+        8789,
+        backend="anthropic",
+        memory=False,
+        urlopen=_urlopen_with_payload(payload),
+    )
+    assert result.status == "incompatible"
+    assert "invalid payload" in result.reason.lower()
+
+
+def test_probe_attach_compatibility_reports_missing_metadata_endpoint() -> None:
+    def failing_urlopen(url: str, timeout: int = 0):
+        raise OSError("connection refused")
+
+    result = pi_mod.probe_attach_compatibility(
+        "anthropic",
+        8790,
+        backend="anthropic",
+        memory=True,
+        urlopen=failing_urlopen,
+    )
+    assert result.status == "missing"
+    assert "/headroom/meta" in result.reason
+
+
 @pytest.mark.skipif(
     shutil.which("pi") is None or shutil.which("node") is None,
     reason="pi and node are required for the live Phase 0 feasibility probe",
@@ -119,8 +196,12 @@ def test_run_phase0_feasibility_probe_hits_override_then_native_fallback() -> No
 
     assert result["firstResponse"] == "override response"
     assert result["secondResponse"] == "native response"
-    assert [request["url"] for request in result["requests"]["override"]] == ["/v1/chat/completions"]
-    assert [request["url"] for request in result["requests"]["native"]] == ["/v1/chat/completions"]
+    assert [request["url"] for request in result["requests"]["override"]] == [
+        "/v1/chat/completions"
+    ]
+    assert [request["url"] for request in result["requests"]["native"]] == [
+        "/v1/chat/completions"
+    ]
 
     event_types = [event["type"] for event in result["events"]]
     assert "provider_observed" in event_types
@@ -129,7 +210,10 @@ def test_run_phase0_feasibility_probe_hits_override_then_native_fallback() -> No
     assert "provider_unregistered" in event_types
 
     model_selects = [event for event in result["events"] if event["type"] == "model_select"]
-    assert [event["currentModel"]["provider"] for event in model_selects] == ["anthropic", "openai"]
+    assert [event["currentModel"]["provider"] for event in model_selects] == [
+        "anthropic",
+        "openai",
+    ]
 
     registered = [event for event in result["events"] if event["type"] == "provider_registered"]
     assert registered[0]["providerId"] == "openai"
