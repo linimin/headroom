@@ -5,7 +5,12 @@ from __future__ import annotations
 import importlib.resources as importlib_resources
 import io
 import json
+import os
 import shutil
+import subprocess
+import sys
+import textwrap
+import zipfile
 from pathlib import Path
 
 import click
@@ -85,6 +90,138 @@ def test_render_pi_extension_copies_packaged_template(tmp_path: Path) -> None:
 
     assert extension_path == tmp_path / "extension.ts"
     assert extension_path.read_text(encoding="utf-8") == pi_mod.load_pi_extension_template()
+
+
+def _run_installed_pi_packaging_probe(tmp_path: Path) -> dict[str, object]:
+    repo_root = Path(__file__).resolve().parents[2]
+    dist_dir = tmp_path / "dist"
+    site_dir = tmp_path / "site"
+    outside_dir = tmp_path / "outside"
+    dist_dir.mkdir()
+    site_dir.mkdir()
+    outside_dir.mkdir()
+
+    build_result = subprocess.run(
+        ["uv", "build", "--wheel", "--out-dir", str(dist_dir)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert build_result.returncode == 0, build_result.stderr or build_result.stdout
+
+    wheel_path = next(dist_dir.glob("*.whl"))
+    with zipfile.ZipFile(wheel_path) as wheel_zip:
+        assert "headroom/providers/pi_extension_template.ts" in set(wheel_zip.namelist())
+        wheel_zip.extractall(site_dir)
+
+    probe_script = textwrap.dedent(
+        """
+        import importlib.util
+        import json
+        import os
+        import sys
+        import tempfile
+        import types
+        from pathlib import Path
+
+        repo_root = Path(os.environ["HEADROOM_PI_PACKAGING_REPO_ROOT"]).resolve()
+        site_dir = Path(os.environ["HEADROOM_PI_PACKAGING_SITE_DIR"]).resolve()
+        outside_dir = Path(os.environ["HEADROOM_PI_PACKAGING_OUTSIDE_DIR"]).resolve()
+
+        def _inside_repo(raw_path: str) -> bool:
+            try:
+                Path(raw_path).resolve().relative_to(repo_root)
+            except ValueError:
+                return False
+            return True
+
+        def _stub_package(name: str, package_dir: Path) -> None:
+            spec = importlib.util.spec_from_file_location(
+                name,
+                package_dir / "__init__.py",
+                submodule_search_locations=[str(package_dir)],
+            )
+            assert spec is not None
+            module = types.ModuleType(name)
+            module.__file__ = str(package_dir / "__init__.py")
+            module.__path__ = [str(package_dir)]
+            module.__package__ = name
+            module.__spec__ = spec
+            sys.modules[name] = module
+
+        def _load_module(name: str, module_path: Path):
+            spec = importlib.util.spec_from_file_location(name, module_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
+
+        os.chdir(outside_dir)
+        sys.path = [str(site_dir)] + [path for path in sys.path if path and not _inside_repo(path)]
+        _stub_package("headroom", site_dir / "headroom")
+        _stub_package("headroom.providers", site_dir / "headroom" / "providers")
+        _load_module("headroom._version", site_dir / "headroom" / "_version.py")
+        pi_module = _load_module("headroom.providers.pi", site_dir / "headroom" / "providers" / "pi.py")
+
+        with tempfile.TemporaryDirectory(dir=outside_dir) as temp_dir_str:
+            temp_dir = Path(temp_dir_str)
+            session_config_path = temp_dir / "session.json"
+            session_config_path.write_text("{}\\n", encoding="utf-8")
+            extension_path = pi_module.render_pi_extension(temp_dir, session_config_path)
+            print(
+                json.dumps(
+                    {
+                        "cwd": str(Path.cwd()),
+                        "module": str(Path(pi_module.__file__).resolve()),
+                        "template_len": len(pi_module.load_pi_extension_template()),
+                        "rendered": str(extension_path.resolve()),
+                        "contains_env": "HEADROOM_PI_SESSION_CONFIG"
+                        in extension_path.read_text(encoding="utf-8"),
+                    }
+                )
+            )
+        """
+    )
+    env = os.environ.copy()
+    env["HEADROOM_PI_PACKAGING_REPO_ROOT"] = str(repo_root)
+    env["HEADROOM_PI_PACKAGING_SITE_DIR"] = str(site_dir)
+    env["HEADROOM_PI_PACKAGING_OUTSIDE_DIR"] = str(outside_dir)
+    env["PYTHONPATH"] = str(site_dir)
+    probe_result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--no-project",
+            "--python",
+            f"{sys.version_info.major}.{sys.version_info.minor}",
+            "--with",
+            "click>=8.1.0",
+            "python",
+            "-c",
+            probe_script,
+        ],
+        cwd=outside_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        timeout=120,
+    )
+    assert probe_result.returncode == 0, probe_result.stderr or probe_result.stdout
+    return json.loads(probe_result.stdout)
+
+
+def test_installed_pi_packaging_probe_renders_extension_from_built_wheel(tmp_path: Path) -> None:
+    result = _run_installed_pi_packaging_probe(tmp_path)
+
+    assert result["cwd"].endswith("/outside")
+    assert result["module"].endswith("/site/headroom/providers/pi.py")
+    assert result["template_len"] > 0
+    assert result["rendered"].endswith("/extension.ts")
+    assert result["contains_env"] is True
 
 
 def test_build_pi_launch_args_appends_headroom_extension(tmp_path: Path) -> None:
