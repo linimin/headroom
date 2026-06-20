@@ -1070,11 +1070,12 @@ def get_copilot_token_provider() -> CopilotTokenProvider:
 
 
 def _is_copilot_api_token(token: str) -> bool:
-    """Return True when the token looks like a short-lived Copilot API token.
+    """Return ``True`` when *token* looks like a short-lived Copilot API token.
 
-    Copilot API tokens currently use the "tid_" prefix.
-    GitHub OAuth tokens (for example "gho_", "ghs_", "ghp_", "github_pat_")
-    should be exchanged and must not be forwarded directly.
+    Copilot API tokens currently appear either as the older ``tid_...``
+    shape or the newer semicolon-delimited ``tid=...;exp=...`` shape.
+    GitHub OAuth tokens (for example ``gho_``, ``ghs_``, ``ghp_``,
+    ``github_pat_``) must be exchanged and must not be forwarded directly.
     """
     normalized = token.strip()
     if not normalized:
@@ -1088,13 +1089,13 @@ def _is_copilot_api_token(token: str) -> bool:
     ):
         return False
 
-    return normalized.startswith("tid_")
+    return normalized.startswith("tid_") or normalized.startswith("tid=")
 
 
 def _token_kind(token: str) -> str:
-    """Return a non-sensitive label for the token type, safe to log."""
+    """Return a non-sensitive token-type label safe for logs."""
     t = token.strip()
-    for prefix in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+    for prefix in ("tid_", "tid=", "gho_", "ghs_", "ghp_", "github_pat_"):
         if t.startswith(prefix):
             return prefix + "***"
     return "unknown" if t else "empty"

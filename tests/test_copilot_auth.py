@@ -612,18 +612,22 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
         fake_get_api_token,
     )
 
-    headers = asyncio.run(
-        copilot_auth.apply_copilot_api_auth(
-            {
-                "authorization": "Bearer tid_existing_copilot_token",
-                "x-api-key": "sk-downstream",
-            },
-            url="https://api.githubcopilot.com/v1/chat/completions",
+    for token in (
+        "tid_existing_copilot_token",
+        "tid=session-token;exp=9999999999;proxy-ep=api.githubcopilot.com",
+    ):
+        headers = asyncio.run(
+            copilot_auth.apply_copilot_api_auth(
+                {
+                    "authorization": f"Bearer {token}",
+                    "x-api-key": "sk-downstream",
+                },
+                url="https://api.githubcopilot.com/v1/chat/completions",
+            )
         )
-    )
 
-    assert headers["authorization"] == "Bearer tid_existing_copilot_token"
-    assert "x-api-key" not in headers
+        assert headers["authorization"] == f"Bearer {token}"
+        assert "x-api-key" not in headers
 
 
 def test_apply_copilot_api_auth_replaces_github_oauth_bearer(
@@ -682,6 +686,12 @@ def test_apply_copilot_api_auth_replaces_non_bearer_auth(
 
 def test_is_copilot_api_token_matches_expected_prefixes() -> None:
     assert copilot_auth._is_copilot_api_token("tid_session_token") is True
+    assert (
+        copilot_auth._is_copilot_api_token(
+            "tid=session-token;exp=9999999999;proxy-ep=api.githubcopilot.com"
+        )
+        is True
+    )
     assert copilot_auth._is_copilot_api_token("gho_oauth") is False
     assert copilot_auth._is_copilot_api_token("ghs_oauth") is False
     assert copilot_auth._is_copilot_api_token("ghp_oauth") is False
@@ -939,6 +949,12 @@ def test_is_copilot_api_token_returns_false_for_empty_string() -> None:
 
 def test_token_kind_returns_known_prefixes() -> None:
     assert copilot_auth._token_kind("tid_x") == "tid_***"  # noqa: S105
+    assert (
+        copilot_auth._token_kind(
+            "tid=session-token;exp=9999999999;proxy-ep=api.githubcopilot.com"
+        )
+        == "tid=***"
+    )
     assert copilot_auth._token_kind("gho_x") == "gho_***"  # noqa: S105
     assert copilot_auth._token_kind("ghs_x") == "ghs_***"  # noqa: S105
     assert copilot_auth._token_kind("ghp_x") == "ghp_***"  # noqa: S105
