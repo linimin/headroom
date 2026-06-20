@@ -47,7 +47,7 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG c
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language
-- **Agent wrap** — `headroom wrap claude|codex|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe` in one command; undo with `headroom unwrap <tool>`
+- **Agent wrap** — `headroom wrap claude|codex|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|pi` in one command; Cursor prints config to paste once, `pi` runs via a temporary session-scoped extension, and durable wrappers can be undone with `headroom unwrap <tool>`
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client
 - **Cross-agent memory** — shared store across Claude, Codex, Gemini, auto-dedup
 - **`headroom learn`** — mines failed sessions, writes corrections to `CLAUDE.local.md` (default, gitignored) or `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`
@@ -190,21 +190,22 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 
 ## Agent compatibility matrix
 
-| Agent        | `headroom wrap` | Notes                            |
-|--------------|:---------------:|----------------------------------|
+| Agent        | `headroom wrap` | Notes                                             |
+|--------------|:---------------:|---------------------------------------------------|
 | Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
-| Codex        | ✅              | shares memory with Claude        |
+| Codex        | ✅              | shares memory with Claude                         |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
-| Aider        | ✅              | starts proxy + launches          |
-| Copilot CLI  | ✅              | starts proxy + launches          |
-| OpenClaw     | ✅              | installs as ContextEngine plugin |
-| OpenCode     | ✅              | injects config · starts proxy + launches |
-| Cline        | ✅              | starts proxy + injects config    |
-| Continue     | ✅              | starts proxy + injects config    |
-| Goose        | ✅              | starts proxy + launches          |
-| OpenHands    | ✅              | starts proxy + launches          |
-| Mistral Vibe | ✅              | starts proxy + launches          |
-| Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`) |
+| Aider        | ✅              | starts proxy + launches                           |
+| Copilot CLI  | ✅              | starts proxy + launches                           |
+| pi           | ✅              | session-scoped extension + multi-provider routing |
+| OpenClaw     | ✅              | installs as ContextEngine plugin                  |
+| OpenCode     | ✅              | injects config · starts proxy + launches          |
+| Cline        | ✅              | starts proxy + injects config                     |
+| Continue     | ✅              | starts proxy + injects config                     |
+| Goose        | ✅              | starts proxy + launches                           |
+| OpenHands    | ✅              | starts proxy + launches                           |
+| Mistral Vibe | ✅              | starts proxy + launches                           |
+| Cortex Code  | Library only    | 60–65% savings (library mode; no `wrap`)          |
 
 Any OpenAI-compatible client works via `headroom proxy`. MCP-native: `headroom mcp install`.
 Undo durable wrapping with `headroom unwrap <tool>` (supports: `claude`, `copilot`, `codex`, `opencode`, `openclaw`).
@@ -238,6 +239,32 @@ override. Headroom uses GitHub's normal token-exchange endpoint and the Copilot
 API endpoint advertised for the signed-in account.
 
 Platform support note: macOS auth reuse via Copilot CLI Keychain storage has been smoke-tested. Windows Credential Manager, Linux Secret Service / `secret-tool`, and Docker/CI token-injection paths are implemented or planned as auth-discovery paths, but still need real OS validation before they should be considered fully vetted. For Docker and CI, prefer passing an explicit `GITHUB_COPILOT_TOKEN` or `GITHUB_COPILOT_GITHUB_TOKEN` rather than relying on host keychain access.
+
+### pi session-scoped multi-provider wrap
+
+Headroom also supports `pi` through a temporary session-only extension:
+
+```bash
+headroom wrap pi
+headroom wrap pi --provider github-copilot -- --model github-copilot/gpt-5.4
+headroom wrap pi --provider openai --port 8787 -- --continue
+```
+
+`headroom wrap pi` keeps Headroom's proxy lifecycle in the wrapper and uses a checked-in TypeScript extension only for in-session routing. The wrapper does **not** persist anything under `~/.pi`, and the generated extension/session config live only for that launched session.
+
+Supported v1 provider scope is exactly:
+
+- `openai`
+- `anthropic`
+- `github-copilot`
+
+Parity rules for the current release:
+
+- `--provider` is repeatable; omit it to manage all three supported providers.
+- `--port` is valid only when exactly one provider is managed. Multi-provider runs use canonical default ports.
+- If a compatible Headroom proxy is already running on the needed port, `headroom wrap pi` attaches instead of restarting it. Incompatible proxies are rejected before launch.
+- User-supplied pi `--extension` passthrough is rejected in v1 because deterministic extension conflict ordering is not yet part of the supported contract.
+- Unsupported pi providers remain unmanaged and fall back to pi's native behavior.
 
 ## When to use · When to skip
 

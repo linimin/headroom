@@ -5246,24 +5246,24 @@ def _start_pi_managed_proxies(
     "providers",
     multiple=True,
     type=click.Choice(_PI_SUPPORTED_PROVIDERS, case_sensitive=False),
-    help="Managed pi provider (repeatable). Defaults to the full v1 provider set.",
+    help="Managed pi provider (repeatable: openai, anthropic, github-copilot). Defaults to all three.",
 )
 @click.option(
     "--port",
     "-p",
     default=None,
     type=int,
-    help="Override the managed proxy port when exactly one provider is selected.",
+    help="Override the managed proxy port only when exactly one provider is selected.",
 )
 @click.option(
     "--backend",
     default=None,
-    help="Backend applied uniformly to wrapper-owned pi proxies.",
+    help="Backend applied uniformly across wrapper-owned pi proxies in this session.",
 )
 @click.option(
     "--memory",
     is_flag=True,
-    help="Enable memory uniformly for wrapper-owned pi proxies.",
+    help="Enable memory uniformly across wrapper-owned pi proxies in this session.",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
@@ -5275,7 +5275,15 @@ def pi(
     verbose: bool,
     pi_args: tuple[str, ...],
 ) -> None:
-    """Launch pi with a session-scoped Headroom extension and managed proxy lifecycle."""
+    """Launch pi with a temporary Headroom extension and managed proxy lifecycle.
+
+    The extension is session-scoped only: `headroom wrap pi` does not edit `~/.pi` or install
+    persistent config. v1 manages only `openai`, `anthropic`, and `github-copilot`; omit
+    `--provider` to manage all three, and use `--port` only when exactly one provider is managed.
+    Existing compatible proxies are attached instead of restarted, and user-supplied pi
+    `--extension` arguments remain rejected in v1 because deterministic conflict ordering is not
+    yet part of the supported contract.
+    """
 
     pi_binary = _resolve_pi_binary()
     managed_providers = _resolve_pi_managed_providers(providers)

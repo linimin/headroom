@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources as importlib_resources
 import io
 import json
 import shutil
@@ -66,6 +67,34 @@ def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: 
     assert quiet_env[pi_mod.PI_SESSION_CONFIG_ENV] == str(session_path)
     assert pi_mod.PI_VERBOSE_ENV not in quiet_env
     assert loud_env[pi_mod.PI_VERBOSE_ENV] == "1"
+
+
+def test_load_pi_extension_template_reads_packaged_asset() -> None:
+    packaged_template = (
+        importlib_resources.files("headroom.providers")
+        .joinpath(pi_mod.PI_EXTENSION_TEMPLATE_ASSET)
+        .read_text(encoding="utf-8")
+    )
+
+    assert pi_mod.load_pi_extension_template() == packaged_template
+    assert "HEADROOM_PI_SESSION_CONFIG" in packaged_template
+
+
+def test_render_pi_extension_copies_packaged_template(tmp_path: Path) -> None:
+    extension_path = pi_mod.render_pi_extension(tmp_path, tmp_path / "session.json")
+
+    assert extension_path == tmp_path / "extension.ts"
+    assert extension_path.read_text(encoding="utf-8") == pi_mod.load_pi_extension_template()
+
+
+def test_build_pi_launch_args_appends_headroom_extension(tmp_path: Path) -> None:
+    extension_path = tmp_path / "extension.ts"
+
+    assert pi_mod.build_pi_launch_args(("--continue",), extension_path) == (
+        "--continue",
+        "--extension",
+        str(extension_path),
+    )
 
 
 @pytest.mark.parametrize(

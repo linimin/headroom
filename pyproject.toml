@@ -350,6 +350,8 @@ default = true
 include = [
     { path = "LICENSE", format = "sdist" },
     { path = "NOTICE", format = "sdist" },
+    # wrap-pi ships a checked-in TypeScript extension asset; keep it explicit in sdists.
+    { path = "headroom/providers/pi_extension_template.ts", format = "sdist" },
 ]
 python-source = "."
 module-name = "headroom._core"

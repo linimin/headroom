@@ -223,6 +223,26 @@ def test_wrap_pi_rejects_user_supplied_extension_passthrough_before_proxy_start(
     start_proxies.assert_not_called()
 
 
+def test_wrap_pi_help_describes_supported_v1_contract(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+
+    result = runner.invoke(main, ["wrap", "pi", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "temporary Headroom extension" in result.output
+    assert "openai" in result.output
+    assert "anthropic" in result.output
+    assert "github-copilot" in result.output
+    assert "--port" in result.output
+    assert "exactly one provider is managed" in result.output
+    assert "user-supplied pi" in result.output
+    assert "Defaults" in result.output
+    assert "all three" in result.output
+
+
 def test_start_or_attach_pi_proxy_accepts_compatible_attach(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
