@@ -489,23 +489,32 @@ export default function (pi: ExtensionAPI) {
     if ((!force && !needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
       return config;
     }
-    try {
-      const response = await fetch(`${config.controlUrl}/ensure-provider`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          providerId,
-          modelApi: currentModel?.api ?? null,
-          modelId: currentModel?.id ?? null,
-        }),
-      });
-      if (!response.ok) {
-        return config;
+
+    const maxEnsureAttempts = force ? 8 : 1;
+    for (let attempt = 0; attempt < maxEnsureAttempts; attempt += 1) {
+      try {
+        const response = await fetch(`${config.controlUrl}/ensure-provider`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            providerId,
+            modelApi: currentModel?.api ?? null,
+            modelId: currentModel?.id ?? null,
+          }),
+        });
+        if (response.ok) {
+          return await loadConfig();
+        }
+      } catch {
+        // Best-effort only; force mode retries transient control-plane failures.
       }
-      return await loadConfig();
-    } catch {
-      return config;
+      if (attempt + 1 < maxEnsureAttempts) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, force ? 250 : 0);
+        });
+      }
     }
+    return config;
   };
 
   const refreshPerfSummary = async (
