@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import io
 import json
@@ -27,6 +28,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
@@ -5092,6 +5094,100 @@ class _PiManagedProxy:
     process: subprocess.Popen[Any] | None = None
 
 
+class _PiWrapControlServer:
+    """Best-effort local control plane for lazy wrap-pi provider startup."""
+
+    def __init__(
+        self,
+        *,
+        session_config_path: Path,
+        session_config: dict[str, Any],
+        proxies: list[_PiManagedProxy],
+        provider_ports: Mapping[str, int],
+        backend: str | None,
+        memory: bool,
+        verbose: bool,
+    ) -> None:
+        self._session_config_path = session_config_path
+        self._session_config = session_config
+        self._proxies = proxies
+        self._provider_ports = dict(provider_ports)
+        self._backend = backend
+        self._memory = memory
+        self._verbose = verbose
+        self._lock = threading.Lock()
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path != "/ensure-provider":
+                    self.send_error(404)
+                    return
+                try:
+                    length = int(self.headers.get("content-length", "0") or "0")
+                    raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+                    payload = json.loads(raw)
+                    provider_id = str(payload.get("providerId") or "").strip().lower()
+                    if provider_id not in _PI_SUPPORTED_PROVIDERS:
+                        raise click.ClickException(f"Unsupported pi provider {provider_id!r}.")
+                    provider_payload = owner.ensure_provider(provider_id)
+                    body = json.dumps({"ok": True, "provider": provider_payload}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as exc:  # pragma: no cover - defensive path
+                    body = json.dumps({"ok": False, "error": str(exc)}).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                return
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def ensure_provider(self, provider_id: str) -> dict[str, Any]:
+        with self._lock:
+            for proxy in self._proxies:
+                if proxy.provider_id == provider_id:
+                    return cast(dict[str, Any], self._session_config["providers"][provider_id])
+            proxy = _start_or_attach_pi_proxy(
+                provider_id,
+                self._provider_ports[provider_id],
+                backend=self._backend,
+                memory=self._memory,
+                verbose=self._verbose,
+            )
+            self._proxies.append(proxy)
+            provider_payload = _build_pi_wrap_session_config(
+                [provider_id],
+                {provider_id: self._provider_ports[provider_id]},
+            )["providers"][provider_id]
+            provider_payload["ownership"] = proxy.ownership
+            cast(dict[str, Any], self._session_config["providers"])[provider_id] = provider_payload
+            self._session_config_path.write_text(
+                json.dumps(self._session_config, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return provider_payload
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+
 def _pi_process_group_signal(proc: subprocess.Popen[Any], signum: int) -> None:
     """Signal a child process or its process group when possible."""
 
@@ -5248,7 +5344,7 @@ def _start_pi_managed_proxies(
     "providers",
     multiple=True,
     type=click.Choice(_PI_SUPPORTED_PROVIDERS, case_sensitive=False),
-    help="Managed pi provider (repeatable: openai, anthropic, github-copilot). Defaults to all three.",
+    help="Managed pi provider (repeatable: openai, anthropic, github-copilot). Omit to lazy-manage only the current provider.",
 )
 @click.option(
     "--port",
@@ -5281,7 +5377,8 @@ def pi(
 
     The extension is session-scoped only: `headroom wrap pi` does not edit `~/.pi` or install
     persistent config. v1 manages only `openai`, `anthropic`, and `github-copilot`; omit
-    `--provider` to manage all three, and use `--port` only when exactly one provider is managed.
+    `--provider` to lazy-manage only the current provider on demand, and use `--port` only when
+    exactly one provider is managed.
     Existing compatible proxies are attached instead of restarted, and user-supplied pi
     `--extension` arguments remain rejected in v1 because deterministic conflict ordering is not
     yet part of the supported contract.
@@ -5293,6 +5390,7 @@ def pi(
     resolved_backend = _resolve_pi_proxy_backend(backend)
     proxies: list[_PiManagedProxy] = []
     pi_process: subprocess.Popen[Any] | None = None
+    control_server: _PiWrapControlServer | None = None
     cleaned = False
 
     def cleanup(*, forwarded_signal: int | None = None) -> None:
@@ -5300,6 +5398,8 @@ def pi(
         if cleaned:
             return
         cleaned = True
+        if control_server is not None:
+            control_server.close()
         _cleanup_pi_wrap_session(
             pi_process,
             proxies,
@@ -5321,18 +5421,38 @@ def pi(
             extension_path = _render_pi_extension(temp_dir, temp_dir / "session.json")
             args = _build_pi_launch_args(pi_args, extension_path)
 
+            eager_managed_providers = managed_providers if providers else []
             proxies = _start_pi_managed_proxies(
-                managed_providers,
+                eager_managed_providers,
                 provider_ports,
                 backend=resolved_backend,
                 memory=memory,
                 verbose=verbose,
             )
 
-            session_config = _build_pi_wrap_session_config(managed_providers, provider_ports)
+            session_config = _build_pi_wrap_session_config(
+                managed_providers,
+                provider_ports,
+                auto_manage_current_provider_only=not providers,
+            )
             for proxy in proxies:
                 session_config["providers"][proxy.provider_id]["ownership"] = proxy.ownership
             session_config_path = _write_pi_session_config(temp_dir, session_config)
+            if not providers:
+                control_server = _PiWrapControlServer(
+                    session_config_path=session_config_path,
+                    session_config=session_config,
+                    proxies=proxies,
+                    provider_ports=provider_ports,
+                    backend=resolved_backend,
+                    memory=memory,
+                    verbose=verbose,
+                )
+                session_config["controlUrl"] = control_server.url
+                session_config_path.write_text(
+                    json.dumps(session_config, indent=2) + "\n",
+                    encoding="utf-8",
+                )
             env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
 
             _print_wrap_banner("pi")
@@ -5342,6 +5462,7 @@ def pi(
                 click.echo(f" HEADROOM_PI_SESSION_CONFIG={session_config_path}")
                 click.echo(f" extension={extension_path}")
                 click.echo(f" managed_providers={', '.join(managed_providers)}")
+                click.echo(f" lazy_auto_manage_current_provider_only={not providers}")
                 click.echo(f" backend={resolved_backend}")
                 click.echo(f" memory={memory}")
                 click.echo(f" args: {' '.join(args)}")

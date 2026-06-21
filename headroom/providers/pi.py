@@ -192,6 +192,8 @@ def build_pi_wrap_session_config(
     reattach_successes: int = 2,
     enable_status_command: bool = True,
     enable_footer: bool = True,
+    auto_manage_current_provider_only: bool = False,
+    control_url: str | None = None,
     phase0: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical versioned `session.json` payload for `wrap pi`."""
@@ -222,7 +224,10 @@ def build_pi_wrap_session_config(
             "enableStatusCommand": enable_status_command,
             "enableFooter": enable_footer,
         },
+        "autoManageCurrentProviderOnly": auto_manage_current_provider_only,
     }
+    if control_url:
+        payload["controlUrl"] = control_url
     if phase0:
         payload["phase0"] = dict(phase0)
     return payload

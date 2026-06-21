@@ -103,7 +103,7 @@ class _FakeManagedProcess:
         self._done = True
 
 
-def test_wrap_pi_defaults_to_v1_session_config_and_launches_with_one_extension(
+def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_extension(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
@@ -138,6 +138,50 @@ def test_wrap_pi_defaults_to_v1_session_config_and_launches_with_one_extension(
     assert captured["session_config"]["managedProviders"] == ["openai"]
     assert captured["session_config"]["providers"]["openai"]["ownership"] == "owned"
     assert "HEADROOM_PI_SESSION_CONFIG" in captured["extension_contents"]
+
+
+def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_start(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, main = wrap_modules
+    captured: dict[str, object] = {}
+
+    def fake_start_pi_managed_proxies(managed_providers, provider_ports, **kwargs):
+        captured["managed_providers"] = managed_providers
+        captured["provider_ports"] = provider_ports
+        captured["kwargs"] = kwargs
+        return []
+
+    def fake_popen(command: list[str], env: dict[str, str], start_new_session: bool):
+        captured["command"] = command
+        captured["env"] = env
+        captured["session_config"] = json.loads(
+            Path(env[PI_SESSION_CONFIG_ENV]).read_text(encoding="utf-8")
+        )
+        return _FakePiProcess()
+
+    with (
+        patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
+    ):
+        result = runner.invoke(main, ["wrap", "pi"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["managed_providers"] == []
+    assert captured["provider_ports"] == {
+        "openai": 8789,
+        "anthropic": 8790,
+        "github-copilot": 8788,
+    }
+    assert captured["session_config"]["managedProviders"] == [
+        "openai",
+        "anthropic",
+        "github-copilot",
+    ]
+    assert captured["session_config"]["autoManageCurrentProviderOnly"] is True
+    assert captured["session_config"]["controlUrl"].startswith("http://127.0.0.1:")
 
 
 def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
@@ -238,9 +282,7 @@ def test_wrap_pi_help_describes_supported_v1_contract(
     assert "github-copilot" in result.output
     assert "--port" in result.output
     assert "exactly one provider is managed" in result.output
-    assert "user-supplied pi" in result.output
-    assert "Defaults" in result.output
-    assert "all three" in result.output
+    assert "lazy-manage only the current provider" in result.output
 
 
 def test_start_or_attach_pi_proxy_accepts_compatible_attach(

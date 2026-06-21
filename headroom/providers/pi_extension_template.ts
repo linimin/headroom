@@ -34,6 +34,8 @@ interface SessionConfig {
   providers: Record<string, SessionProviderConfig>;
   health: SessionHealthConfig;
   ui?: SessionUiConfig;
+  autoManageCurrentProviderOnly?: boolean;
+  controlUrl?: string;
   phase0?: Phase0Config;
 }
 
@@ -410,6 +412,28 @@ export default function (pi: ExtensionAPI) {
     };
   };
 
+  const ensureManagedProvider = async (
+    config: SessionConfig,
+    providerId: string,
+  ): Promise<SessionConfig> => {
+    if (!config.autoManageCurrentProviderOnly || !config.controlUrl || config.providers[providerId]) {
+      return config;
+    }
+    try {
+      const response = await fetch(`${config.controlUrl}/ensure-provider`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ providerId }),
+      });
+      if (!response.ok) {
+        return config;
+      }
+      return await loadConfig();
+    } catch {
+      return config;
+    }
+  };
+
   const refreshPerfSummary = async (
     providerId: string,
     managedConfig: SessionProviderConfig,
@@ -626,29 +650,34 @@ export default function (pi: ExtensionAPI) {
 
     await unregisterOtherProviders(config, providerId, `${reason}:switched-provider`);
 
-    const managedConfig = config.providers[providerId];
+    let workingConfig = config;
+    if (workingConfig.managedProviders.includes(providerId) && !workingConfig.providers[providerId]) {
+      workingConfig = await ensureManagedProvider(workingConfig, providerId);
+    }
+
+    const managedConfig = workingConfig.providers[providerId];
     if (!managedConfig) {
       await unregisterProvider(config, providerId, `${reason}:unmanaged-provider`);
       return;
     }
 
-    if (config.phase0?.forceNativeProviders?.includes(providerId)) {
-      await unregisterProvider(config, providerId, `${reason}:forced-native`);
+    if (workingConfig.phase0?.forceNativeProviders?.includes(providerId)) {
+      await unregisterProvider(workingConfig, providerId, `${reason}:forced-native`);
       return;
     }
 
-    const healthState = await refreshProviderHealth(config, providerId, reason);
+    const healthState = await refreshProviderHealth(workingConfig, providerId, reason);
     const shouldAttach =
       healthState.status === "healthy" ||
       (healthState.status === "suspect" && (healthState.hasEverAttached || registeredProviders.has(providerId)));
 
     if (!shouldAttach) {
-      await unregisterProvider(config, providerId, `${reason}:proxy-${healthState.status}`);
+      await unregisterProvider(workingConfig, providerId, `${reason}:proxy-${healthState.status}`);
       return;
     }
 
     await registerProvider(
-      config,
+      workingConfig,
       providerId,
       managedConfig,
       reason,
