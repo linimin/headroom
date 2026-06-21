@@ -645,6 +645,7 @@ export default function (pi: ExtensionAPI) {
       lines.push(`Variant: ${variantKey ?? managedConfig.defaultVariant ?? "openai"}`);
     }
     lines.push(
+      `Ownership: ${targetConfig.ownership ?? "(unknown)"}`,
       `Backend: ${targetConfig.backend ?? "(unknown)"}`,
       `Family: ${targetConfig.family}`,
       `Routed base URL: ${targetConfig.routedBaseUrl}`,

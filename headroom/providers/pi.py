@@ -116,8 +116,7 @@ def default_provider_ports() -> dict[str, int]:
     """Return canonical default proxy ports for `wrap pi`."""
 
     return {
-        provider_id: spec.default_port
-        for provider_id, spec in managed_provider_specs().items()
+        provider_id: spec.default_port for provider_id, spec in managed_provider_specs().items()
     }
 
 
@@ -201,7 +200,9 @@ def resolve_provider_ports(
     if port_override is None:
         return {provider_id: ports[provider_id] for provider_id in managed_providers}
     if len(managed_providers) != 1:
-        raise click.ClickException("'--port' is only valid when exactly one pi provider is managed.")
+        raise click.ClickException(
+            "'--port' is only valid when exactly one pi provider is managed."
+        )
     provider_id = managed_providers[0]
     return {provider_id: port_override}
 
@@ -325,7 +326,11 @@ def build_pi_wrap_session_config(
     providers: dict[str, Any] = {}
     for provider_id in managed_providers:
         port = provider_ports[provider_id]
-        if provider_id == "github-copilot" and provider_variant_ports and provider_id in provider_variant_ports:
+        if (
+            provider_id == "github-copilot"
+            and provider_variant_ports
+            and provider_id in provider_variant_ports
+        ):
             variant_ports = provider_variant_ports[provider_id]
             variant_backends = (provider_variant_backends or {}).get(provider_id, {})
             providers[provider_id] = build_pi_copilot_provider_payload(
@@ -615,8 +620,7 @@ def probe_attach_compatibility(
             provider_id=provider_id,
             port=port,
             reason=(
-                f"Metadata on port {port} reports memory={metadata.memory!r}, "
-                f"expected {memory!r}."
+                f"Metadata on port {port} reports memory={metadata.memory!r}, expected {memory!r}."
             ),
             metadata=metadata,
         )
@@ -642,7 +646,6 @@ def _derive_pi_sdk_index_path(pi_binary: str) -> Path:
     raise RuntimeError(
         f"Unable to derive pi SDK path from executable {pi_binary!r}; expected dist/index.js nearby."
     )
-
 
 
 def run_phase0_feasibility_probe(pi_binary: str | None = None) -> dict[str, Any]:
@@ -672,7 +675,9 @@ def run_phase0_feasibility_probe(pi_binary: str | None = None) -> dict[str, Any]
 
         session_config = json.loads(session_config_path.read_text(encoding="utf-8"))
         session_config["phase0"] = {"logPath": str(log_path), "forceNativeProviders": []}
-        session_config_path.write_text(json.dumps(session_config, indent=2) + "\n", encoding="utf-8")
+        session_config_path.write_text(
+            json.dumps(session_config, indent=2) + "\n", encoding="utf-8"
+        )
 
         script_path.write_text(
             _build_phase0_probe_script(
@@ -703,7 +708,6 @@ def run_phase0_feasibility_probe(pi_binary: str | None = None) -> dict[str, Any]
                 f"STDERR:\n{result.stderr}"
             )
         return json.loads(results_path.read_text(encoding="utf-8"))
-
 
 
 def _build_phase0_probe_script(
@@ -1031,7 +1035,6 @@ def run_dynamic_routing_probe(pi_binary: str | None = None) -> dict[str, Any]:
                 f"STDERR:\n{result.stderr}"
             )
         return json.loads(results_path.read_text(encoding="utf-8"))
-
 
 
 def _build_dynamic_routing_probe_script(
@@ -1406,4 +1409,3 @@ def _build_dynamic_routing_probe_script(
         .replace("__WORK_DIR__", json.dumps(str(work_dir)))
         .replace("__AGENT_DIR__", json.dumps(str(agent_dir)))
     )
-

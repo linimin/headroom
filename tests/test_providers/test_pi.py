@@ -66,8 +66,14 @@ def test_build_pi_wrap_session_config_renders_routed_urls() -> None:
     assert config["providers"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8790"
     assert config["providers"]["github-copilot"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
     assert config["providers"]["github-copilot"]["backend"] == "openai"
-    assert config["providers"]["github-copilot"]["variants"]["openai"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
-    assert config["providers"]["github-copilot"]["variants"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8791"
+    assert (
+        config["providers"]["github-copilot"]["variants"]["openai"]["routedBaseUrl"]
+        == "http://127.0.0.1:8788/v1"
+    )
+    assert (
+        config["providers"]["github-copilot"]["variants"]["anthropic"]["routedBaseUrl"]
+        == "http://127.0.0.1:8791"
+    )
     assert config["providers"]["github-copilot"]["variants"]["anthropic"]["backend"] == "anthropic"
     assert config["phase0"] == {"forceNativeProviders": ["openai"]}
 
@@ -110,17 +116,23 @@ def test_resolve_pi_provider_backend_uses_provider_specific_defaults() -> None:
 
 
 def test_resolve_pi_provider_backend_switches_copilot_claude_models_to_anthropic() -> None:
-    assert pi_mod.resolve_pi_provider_backend(
-        "github-copilot",
-        None,
-        model_api="anthropic-messages",
-        model_id="claude-opus-4.6",
-    ) == "anthropic"
-    assert pi_mod.resolve_pi_provider_family(
-        "github-copilot",
-        model_api="anthropic-messages",
-        model_id="claude-opus-4.6",
-    ) == "anthropic"
+    assert (
+        pi_mod.resolve_pi_provider_backend(
+            "github-copilot",
+            None,
+            model_api="anthropic-messages",
+            model_id="claude-opus-4.6",
+        )
+        == "anthropic"
+    )
+    assert (
+        pi_mod.resolve_pi_provider_family(
+            "github-copilot",
+            model_api="anthropic-messages",
+            model_id="claude-opus-4.6",
+        )
+        == "anthropic"
+    )
 
 
 def test_resolve_pi_provider_backend_respects_explicit_override() -> None:
@@ -144,13 +156,17 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "headroom-status" in packaged_template
     assert "Dashboard:" in packaged_template
     assert "Variant:" in packaged_template
+    assert "Ownership:" in packaged_template
     assert "Headroom took over" in packaged_template
     assert "Headroom reconnecting" in packaged_template
     assert "notifyUiSoon" in packaged_template
     assert "yieldToUi" in packaged_template
     assert "waitForRecoveredHealth" in packaged_template
     assert 'managedConfig.ownership === "owned"' in packaged_template
-    assert 'const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned"' in packaged_template
+    assert (
+        'const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned"'
+        in packaged_template
+    )
     assert "const routeChanged =" in packaged_template
     assert 'healthState.status === "unavailable" && !routeChanged' in packaged_template
     assert "anthropic-messages" in packaged_template
@@ -464,9 +480,7 @@ def test_run_phase0_feasibility_probe_hits_override_then_native_fallback() -> No
     assert [request["url"] for request in result["requests"]["override"]] == [
         "/v1/chat/completions"
     ]
-    assert [request["url"] for request in result["requests"]["native"]] == [
-        "/v1/chat/completions"
-    ]
+    assert [request["url"] for request in result["requests"]["native"]] == ["/v1/chat/completions"]
 
     event_types = [event["type"] for event in result["events"]]
     assert "provider_observed" in event_types
@@ -543,13 +557,13 @@ def test_run_dynamic_routing_probe_proves_hysteresis_and_family_routing() -> Non
 
     observed = [event for event in result["events"] if event["type"] == "provider_observed"]
     assert any(
-        event["resolvedProvider"] == "google"
-        and event["resolutionSource"] == "runtime-provider"
+        event["resolvedProvider"] == "google" and event["resolutionSource"] == "runtime-provider"
         for event in observed
     )
 
     health_checks = [
-        event for event in result["events"]
+        event
+        for event in result["events"]
         if event["type"] == "provider_health_checked" and event["providerId"] == "openai"
     ]
     assert len(health_checks) == 5
@@ -565,4 +579,3 @@ def test_run_dynamic_routing_probe_proves_hysteresis_and_family_routing() -> Non
 
     unregistered = [event for event in result["events"] if event["type"] == "provider_unregistered"]
     assert any(event["providerId"] == "openai" for event in unregistered)
-

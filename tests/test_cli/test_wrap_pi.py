@@ -25,7 +25,9 @@ def runner() -> CliRunner:
 @pytest.fixture
 def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, click.Group]:
     headroom_pkg = sys.modules.get("headroom")
-    saved_headroom_cli_attr = headroom_pkg.cli if headroom_pkg is not None and hasattr(headroom_pkg, "cli") else None
+    saved_headroom_cli_attr = (
+        headroom_pkg.cli if headroom_pkg is not None and hasattr(headroom_pkg, "cli") else None
+    )
     saved_modules = {
         name: sys.modules.get(name)
         for name in ("headroom.cli", "headroom.cli.main", "headroom.cli.wrap")
@@ -127,7 +129,9 @@ def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_e
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
-        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch(
+            "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
+        ),
         patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
     ):
         result = runner.invoke(main, ["wrap", "pi", "--provider", "openai"])
@@ -147,7 +151,9 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
     wrap_cli, main = wrap_modules
     captured: dict[str, object] = {}
 
-    def fake_start_pi_managed_proxies(managed_providers, provider_ports, provider_variant_ports, **kwargs):
+    def fake_start_pi_managed_proxies(
+        managed_providers, provider_ports, provider_variant_ports, **kwargs
+    ):
         captured["managed_providers"] = managed_providers
         captured["provider_ports"] = provider_ports
         captured["provider_variant_ports"] = provider_variant_ports
@@ -164,7 +170,9 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
-        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch(
+            "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
+        ),
         patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
     ):
         result = runner.invoke(main, ["wrap", "pi"])
@@ -226,10 +234,14 @@ def test_wrap_pi_explicit_copilot_session_config_includes_dual_family_variants(
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
-        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch(
+            "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
+        ),
         patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
     ):
-        result = runner.invoke(main, ["wrap", "pi", "--provider", "github-copilot", "--port", "9911"])
+        result = runner.invoke(
+            main, ["wrap", "pi", "--provider", "github-copilot", "--port", "9911"]
+        )
 
     assert result.exit_code == 0, result.output
     copilot = captured["session_config"]["providers"]["github-copilot"]
@@ -248,7 +260,9 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
     wrap_cli, main = wrap_modules
     captured: dict[str, object] = {}
 
-    def fake_start_pi_managed_proxies(managed_providers, provider_ports, provider_variant_ports, **kwargs):
+    def fake_start_pi_managed_proxies(
+        managed_providers, provider_ports, provider_variant_ports, **kwargs
+    ):
         captured["managed_providers"] = managed_providers
         captured["provider_ports"] = provider_ports
         captured["provider_variant_ports"] = provider_variant_ports
@@ -274,7 +288,9 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
-        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch(
+            "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
+        ),
         patch("headroom.cli.wrap.subprocess.Popen", return_value=_FakePiProcess()),
     ):
         result = runner.invoke(
@@ -341,7 +357,10 @@ def test_wrap_pi_rejects_user_supplied_extension_passthrough_before_proxy_start(
         result = runner.invoke(main, ["wrap", "pi", "--", "--extension", "/tmp/user.ts"])
 
     assert result.exit_code != 0
-    assert "User-supplied pi '--extension' arguments are rejected by `headroom wrap pi` v1" in result.output
+    assert (
+        "User-supplied pi '--extension' arguments are rejected by `headroom wrap pi` v1"
+        in result.output
+    )
     start_proxies.assert_not_called()
 
 
@@ -407,9 +426,13 @@ def test_start_or_attach_pi_proxy_accepts_compatible_attach(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
     wrap_cli, _main = wrap_modules
-    probe = SimpleNamespace(status="compatible", reason="ok", metadata=SimpleNamespace(
-        headroom_version="1.0.0", backend="anthropic", upstream_family="openai", memory=False
-    ))
+    probe = SimpleNamespace(
+        status="compatible",
+        reason="ok",
+        metadata=SimpleNamespace(
+            headroom_version="1.0.0", backend="anthropic", upstream_family="openai", memory=False
+        ),
+    )
 
     with (
         patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=probe),
@@ -456,7 +479,9 @@ def test_start_or_attach_pi_proxy_uses_provider_default_backend_and_copilot_env(
     assert state.ownership == "owned"
     assert captured["port"] == 8788
     assert captured["kwargs"]["backend"] == "openai"
-    assert captured["kwargs"]["extra_env"]["OPENAI_TARGET_API_URL"] == "https://api.githubcopilot.com"
+    assert (
+        captured["kwargs"]["extra_env"]["OPENAI_TARGET_API_URL"] == "https://api.githubcopilot.com"
+    )
     assert captured["kwargs"]["extra_env"]["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] == "0"
 
 
@@ -492,7 +517,10 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
     missing_probe = SimpleNamespace(status="missing", reason="down", metadata=None)
 
     with (
-        patch("headroom.cli.wrap._probe_pi_attach_compatibility", side_effect=[missing_probe, missing_probe]),
+        patch(
+            "headroom.cli.wrap._probe_pi_attach_compatibility",
+            side_effect=[missing_probe, missing_probe],
+        ),
         patch("headroom.cli.wrap._port_bind_error", return_value=None),
         patch("headroom.cli.wrap._start_proxy", return_value=_FakeManagedProcess()),
         patch("headroom.cli.wrap.click.echo") as echo,
@@ -532,7 +560,9 @@ def test_pi_wrap_control_server_retries_stale_attached_takeover_until_port_relea
     session_config_path.write_text(json.dumps(session_config, indent=2) + "\n", encoding="utf-8")
     proxies = [wrap_cli._PiManagedProxy("openai", 8789, "attached", "openai", "openai")]
     missing_probe = SimpleNamespace(status="missing", reason="down", metadata=None)
-    owned_proxy = wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", _FakeManagedProcess())
+    owned_proxy = wrap_cli._PiManagedProxy(
+        "openai", 8789, "owned", "openai", "openai", _FakeManagedProcess()
+    )
     start_calls: list[int] = []
 
     def fake_start_or_attach(*args, **kwargs):
@@ -544,8 +574,9 @@ def test_pi_wrap_control_server_retries_stale_attached_takeover_until_port_relea
         return owned_proxy
 
     monkeypatch.setattr(wrap_cli.time, "sleep", lambda _seconds: None)
-    with patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=missing_probe), patch(
-        "headroom.cli.wrap._start_or_attach_pi_proxy", side_effect=fake_start_or_attach
+    with (
+        patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=missing_probe),
+        patch("headroom.cli.wrap._start_or_attach_pi_proxy", side_effect=fake_start_or_attach),
     ):
         control_server = wrap_cli._PiWrapControlServer(
             session_config_path=session_config_path,
@@ -565,6 +596,8 @@ def test_pi_wrap_control_server_retries_stale_attached_takeover_until_port_relea
 
     assert len(start_calls) == 2
     assert provider_payload["ownership"] == "owned"
+
+
 def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
@@ -589,7 +622,9 @@ def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
         pi_proc,
         [
             wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", owned_proc),
-            wrap_cli._PiManagedProxy("anthropic", 8790, "attached", "anthropic", "anthropic", attached_proc),
+            wrap_cli._PiManagedProxy(
+                "anthropic", 8790, "attached", "anthropic", "anthropic", attached_proc
+            ),
         ],
         forwarded_signal=wrap_cli.signal.SIGINT,
     )
@@ -640,7 +675,9 @@ def test_start_pi_managed_proxies_cleans_up_owned_proxies_after_partial_failure(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
     wrap_cli, _main = wrap_modules
-    first_proxy = wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", _FakeManagedProcess())
+    first_proxy = wrap_cli._PiManagedProxy(
+        "openai", 8789, "owned", "openai", "openai", _FakeManagedProcess()
+    )
     cleanup_calls: list[list[str]] = []
 
     def fake_start_or_attach(provider_id: str, *args, **kwargs):

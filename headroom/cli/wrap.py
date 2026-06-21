@@ -5172,7 +5172,11 @@ def _build_pi_session_provider_payload(
         variants = cast(dict[str, dict[str, Any]], payload.get("variants", {}))
         default_variant = str(payload.get("defaultVariant") or "openai")
         for proxy in proxies:
-            if proxy.provider_id != provider_id or not proxy.variant or proxy.variant not in variants:
+            if (
+                proxy.provider_id != provider_id
+                or not proxy.variant
+                or proxy.variant not in variants
+            ):
                 continue
             variant_payload = variants[proxy.variant]
             variant_payload["ownership"] = proxy.ownership
@@ -5751,7 +5755,9 @@ def pi(
 
             _print_wrap_banner("pi")
             click.echo()
-            click.echo(" Launching PI with temporary Headroom extension and managed proxy lifecycle...")
+            click.echo(
+                " Launching PI with temporary Headroom extension and managed proxy lifecycle..."
+            )
             if verbose:
                 click.echo(f" HEADROOM_PI_SESSION_CONFIG={session_config_path}")
                 click.echo(f" extension={extension_path}")
@@ -5773,6 +5779,7 @@ def pi(
         cleanup()
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
+
 
 # OpenClaw
 # =============================================================================
