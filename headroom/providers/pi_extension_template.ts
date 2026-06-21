@@ -97,6 +97,7 @@ export default function (pi: ExtensionAPI) {
   const registeredProviders = new Map<string, string>();
   const providerHealth = new Map<string, ProviderHealthState>();
   const providerPerf = new Map<string, PerfSummary>();
+  const pendingProviderStarts = new Map<string, Promise<void>>();
 
   const normalizeProvider = (value: string | null | undefined): string | null => {
     if (!value) {
@@ -157,6 +158,14 @@ export default function (pi: ExtensionAPI) {
     providerId: string,
     managedConfig: SessionProviderRouteConfig,
   ): string => `${providerId}:${managedConfig.rootUrl}`;
+
+  const providerStartKey = (
+    providerId: string,
+    model: { api?: string | null; id?: string | null } | null,
+  ): string => {
+    const variantKey = desiredVariantKeyForModel(providerId, model);
+    return variantKey ? `${providerId}:${variantKey}` : providerId;
+  };
 
   const dashboardUrl = (managedConfig: SessionProviderRouteConfig): string =>
     `${managedConfig.rootUrl}/dashboard`;
@@ -574,8 +583,16 @@ export default function (pi: ExtensionAPI) {
   ): string => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
-    const managedConfig = providerId ? config.providers[providerId] : undefined;
-    if (!providerId || !managedConfig) {
+    if (!providerId) {
+      return "Headroom:off";
+    }
+
+    if (pendingProviderStarts.has(providerStartKey(providerId, currentModel))) {
+      return `Headroom:${shortProviderLabel(providerId)} warm`;
+    }
+
+    const managedConfig = config.providers[providerId];
+    if (!managedConfig) {
       return "Headroom:off";
     }
 
@@ -652,7 +669,22 @@ export default function (pi: ExtensionAPI) {
   ): string[] => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
-    if (!providerId || !config.providers[providerId]) {
+    if (!providerId) {
+      return [
+        "Headroom: off",
+        "No managed provider is currently selected.",
+      ];
+    }
+
+    if (pendingProviderStarts.has(providerStartKey(providerId, currentModel))) {
+      return [
+        `Provider: ${providerId}`,
+        "Status: starting (native fallback)",
+        `Footer: ${activeStatusLine(config, currentModel)}`,
+      ];
+    }
+
+    if (!config.providers[providerId]) {
       return [
         "Headroom: off",
         "No managed provider is currently selected.",
@@ -819,6 +851,68 @@ export default function (pi: ExtensionAPI) {
     };
   };
 
+  const providerStartNeeds = (
+    config: SessionConfig,
+    providerId: string,
+    currentModel: ModelSnapshot | null,
+  ): { needsMaterialize: boolean; needsCopilotVariantHydration: boolean } => {
+    const existing = config.providers[providerId];
+    const desiredVariant = desiredVariantKeyForModel(providerId, currentModel);
+    return {
+      needsMaterialize: config.autoManageCurrentProviderOnly && !existing,
+      needsCopilotVariantHydration:
+        providerId === "github-copilot" &&
+        !!existing &&
+        !!desiredVariant &&
+        !existing.variants?.[desiredVariant],
+    };
+  };
+
+  const startManagedProviderInBackground = (
+    config: SessionConfig,
+    providerId: string,
+    currentModel: ModelSnapshot | null,
+    reason: string,
+    ctx: ExtensionContext,
+  ): void => {
+    const startKey = providerStartKey(providerId, currentModel);
+    if (pendingProviderStarts.has(startKey)) {
+      setStatusText(ctx, startupStatusLine(providerId));
+      return;
+    }
+
+    const label = providerLabel(providerId, currentModel);
+    setStatusText(ctx, startupStatusLine(providerId));
+    notifyUiSoon(ctx, `Headroom starting ${label} in background...`, "info", 0);
+
+    const pending = (async () => {
+      try {
+        await yieldToUi();
+        await ensureManagedProvider(config, providerId, currentModel, {
+          force: true,
+        });
+        const latestModel = getCurrentModel(ctx);
+        const latestConfig = await loadConfig();
+        const latestResolution = getResolution(latestModel);
+        if (latestResolution.providerId === providerId) {
+          const synced = await syncCurrentProvider(
+            latestConfig,
+            latestModel,
+            `${reason}:background_ready`,
+            ctx,
+            { skipBackgroundStart: true },
+          );
+          updateUiStatus(synced, ctx, latestModel);
+        } else {
+          updateUiStatus(latestConfig, ctx, latestModel);
+        }
+      } finally {
+        pendingProviderStarts.delete(startKey);
+      }
+    })();
+    pendingProviderStarts.set(startKey, pending);
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -886,6 +980,7 @@ export default function (pi: ExtensionAPI) {
     currentModel: ModelSnapshot | null,
     reason: string,
     ctx?: ExtensionContext,
+    options?: { skipBackgroundStart?: boolean },
   ): Promise<SessionConfig> => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
@@ -906,6 +1001,17 @@ export default function (pi: ExtensionAPI) {
 
     let workingConfig = config;
     if (workingConfig.managedProviders.includes(providerId)) {
+      const startNeeds = providerStartNeeds(workingConfig, providerId, currentModel);
+      const shouldBackgroundStart =
+        !options?.skipBackgroundStart &&
+        workingConfig.autoManageCurrentProviderOnly &&
+        ctx !== undefined &&
+        (startNeeds.needsMaterialize || startNeeds.needsCopilotVariantHydration);
+      if (shouldBackgroundStart) {
+        startManagedProviderInBackground(workingConfig, providerId, currentModel, reason, ctx);
+        await unregisterProvider(workingConfig, providerId, `${reason}:background-starting`);
+        return workingConfig;
+      }
       workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel, {
         ctx,
       });
@@ -978,7 +1084,7 @@ export default function (pi: ExtensionAPI) {
           ),
         );
         if (routeChanged || tookOver) {
-          const resynced = await fullResyncProvider(
+              const resynced = await fullResyncProvider(
             workingConfig,
             providerId,
             currentModel,
