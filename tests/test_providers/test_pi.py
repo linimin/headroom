@@ -93,6 +93,11 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
 
     assert pi_mod.load_pi_extension_template() == packaged_template
     assert "HEADROOM_PI_SESSION_CONFIG" in packaged_template
+    assert "githubCopilotOAuthProvider" in packaged_template
+    assert "setStatus" in packaged_template
+    assert "Headroom:" in packaged_template
+    assert "/stats?cached=1" in packaged_template
+    assert "tokensSaved" in packaged_template
 
 
 def test_render_pi_extension_copies_packaged_template(tmp_path: Path) -> None:

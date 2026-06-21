@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { githubCopilotOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { promises as fs } from "node:fs";
 
 interface SessionProviderConfig {
@@ -17,6 +18,11 @@ interface SessionHealthConfig {
   reattachSuccesses: number;
 }
 
+interface SessionUiConfig {
+  enableStatusCommand?: boolean;
+  enableFooter?: boolean;
+}
+
 interface Phase0Config {
   logPath?: string;
   forceNativeProviders?: string[];
@@ -27,6 +33,7 @@ interface SessionConfig {
   managedProviders: string[];
   providers: Record<string, SessionProviderConfig>;
   health: SessionHealthConfig;
+  ui?: SessionUiConfig;
   phase0?: Phase0Config;
 }
 
@@ -35,8 +42,30 @@ interface ModelSnapshot {
   id: string;
 }
 
+interface ProviderModel {
+  provider: string;
+  id?: string;
+  baseUrl?: string;
+  [key: string]: unknown;
+}
+
+type CopilotOAuthProvider = {
+  login?: (...args: unknown[]) => unknown;
+  refreshToken?: (...args: unknown[]) => unknown;
+  getApiKey?: (...args: unknown[]) => unknown;
+  modifyModels?: (models: ProviderModel[], credentials: unknown) => ProviderModel[];
+};
+
 type HealthStatus = "healthy" | "suspect" | "unavailable";
 type ResolutionSource = "runtime-provider" | "model-id" | "unresolved";
+
+interface PerfSummary {
+  requestCount: number;
+  tokensSaved: number;
+  savingsUsd?: number;
+  savingsPercent: number;
+  basis: "history" | "runtime";
+}
 
 interface ProviderHealthState {
   status: HealthStatus;
@@ -50,10 +79,12 @@ interface ProviderHealthState {
 
 const HEALTH_PATHS = ["/health", "/readyz", "/livez"];
 const MANAGED_PROVIDER_PREFIXES = ["openai", "anthropic", "github-copilot"];
+const STATUS_SLOT = "headroom-wrap-pi";
 
 export default function (pi: ExtensionAPI) {
   const registeredProviders = new Map<string, string>();
   const providerHealth = new Map<string, ProviderHealthState>();
+  const providerPerf = new Map<string, PerfSummary>();
 
   const normalizeProvider = (value: string | null | undefined): string | null => {
     if (!value) {
@@ -259,6 +290,199 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const numberOrZero = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : 0;
+
+  const numberOrUndefined = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+  const formatCompactMetric = (value: number): string => {
+    const abs = Math.abs(value);
+    if (abs >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
+    if (abs >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (abs >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+    return String(Math.round(value));
+  };
+
+  const formatSavingsPercent = (value: number): string => `${Math.round(value)}%`;
+
+  const formatCompactUsd = (value: number): string => {
+    const abs = Math.abs(value);
+    if (abs >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`;
+    if (abs >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`;
+    if (abs >= 1_000) return `$${(value / 1_000).toFixed(1)}k`;
+    return `$${value.toFixed(1)}`;
+  };
+
+  const deriveSavingsPercent = (tokensSaved: number, totalInputTokens: number): number => {
+    const totalBefore = Math.max(0, totalInputTokens) + Math.max(0, tokensSaved);
+    return totalBefore > 0 ? (tokensSaved / totalBefore) * 100 : 0;
+  };
+
+  const parsePerfSummary = (payload: unknown): PerfSummary | undefined => {
+    if (!payload || typeof payload !== "object") return undefined;
+
+    const data = payload as {
+      lifetime?: {
+        requests?: unknown;
+        tokens_saved?: unknown;
+        compression_savings_usd?: unknown;
+        total_input_tokens?: unknown;
+      };
+      persistent_savings?: {
+        lifetime?: {
+          requests?: unknown;
+          tokens_saved?: unknown;
+          compression_savings_usd?: unknown;
+          total_input_tokens?: unknown;
+        };
+      };
+      requests?: { total?: unknown };
+      tokens?: { saved?: unknown; savings_percent?: unknown };
+      lifetime_stats?: {
+        total_requests?: unknown;
+        total_tokens_saved?: unknown;
+        total_input_tokens?: unknown;
+        total_estimated_savings_usd?: unknown;
+      };
+      total_requests?: unknown;
+      total_tokens_saved?: unknown;
+      total_input_tokens?: unknown;
+      total_estimated_savings_usd?: unknown;
+    };
+
+    const lifetime =
+      data.lifetime ?? data.persistent_savings?.lifetime ?? data.lifetime_stats;
+
+    if (lifetime && typeof lifetime === "object") {
+      const requestCount = numberOrZero(
+        "requests" in lifetime ? lifetime.requests : lifetime.total_requests,
+      );
+      const tokensSaved = numberOrZero(
+        "tokens_saved" in lifetime ? lifetime.tokens_saved : lifetime.total_tokens_saved,
+      );
+      const totalInputTokens = numberOrZero(
+        "total_input_tokens" in lifetime ? lifetime.total_input_tokens : undefined,
+      );
+      const savingsUsd = numberOrUndefined(
+        "compression_savings_usd" in lifetime
+          ? lifetime.compression_savings_usd
+          : lifetime.total_estimated_savings_usd,
+      );
+
+      if (requestCount > 0 || tokensSaved > 0 || typeof savingsUsd === "number") {
+        return {
+          requestCount,
+          tokensSaved,
+          savingsUsd,
+          savingsPercent: deriveSavingsPercent(tokensSaved, totalInputTokens),
+          basis: "history",
+        };
+      }
+    }
+
+    const requestCount = numberOrZero(data.requests?.total ?? data.total_requests);
+    const tokensSaved = numberOrZero(data.tokens?.saved ?? data.total_tokens_saved);
+    const explicitSavingsPercent = numberOrUndefined(data.tokens?.savings_percent);
+    const totalInputTokens = numberOrZero(data.total_input_tokens);
+    const savingsUsd = numberOrUndefined(data.total_estimated_savings_usd);
+
+    if (
+      requestCount === 0 &&
+      tokensSaved === 0 &&
+      explicitSavingsPercent === undefined &&
+      savingsUsd === undefined
+    ) {
+      return undefined;
+    }
+
+    return {
+      requestCount,
+      tokensSaved,
+      savingsUsd,
+      savingsPercent:
+        explicitSavingsPercent ?? deriveSavingsPercent(tokensSaved, totalInputTokens),
+      basis: "runtime",
+    };
+  };
+
+  const refreshPerfSummary = async (
+    providerId: string,
+    managedConfig: SessionProviderConfig,
+  ): Promise<void> => {
+    const urls = [
+      `${managedConfig.rootUrl}/stats?cached=1`,
+      `${managedConfig.rootUrl}/stats-history`,
+      `${managedConfig.rootUrl}/stats`,
+    ];
+
+    for (const url of urls) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) continue;
+        const payload = (await response.json()) as unknown;
+        const summary = parsePerfSummary(payload);
+        if (!summary) continue;
+        providerPerf.set(providerId, summary);
+        return;
+      } catch {
+        // Footer metrics are best-effort only.
+      }
+    }
+  };
+
+  const shortProviderLabel = (providerId: string): string => {
+    if (providerId === "github-copilot") {
+      return "copilot";
+    }
+    return providerId;
+  };
+
+  const activeStatusLine = (
+    config: SessionConfig,
+    currentModel: ModelSnapshot | null,
+  ): string => {
+    const resolution = getResolution(currentModel);
+    const providerId = resolution.providerId;
+    if (!providerId || !config.providers[providerId]) {
+      return "Headroom:off";
+    }
+
+    const label = shortProviderLabel(providerId);
+    const perf = providerPerf.get(providerId);
+    const usdSuffix =
+      typeof perf?.savingsUsd === "number"
+        ? ` | ${formatCompactUsd(perf.savingsUsd)}`
+        : "";
+    const perfSuffix = perf
+      ? ` | ${formatCompactMetric(perf.tokensSaved)} tok${usdSuffix} | ${formatSavingsPercent(perf.savingsPercent)}`
+      : "";
+
+    if (registeredProviders.has(providerId)) {
+      return `Headroom:${label} ↑${perfSuffix}`;
+    }
+    const healthState = providerHealth.get(providerId);
+    if (healthState?.status === "unavailable") {
+      return `Headroom:${label} down${perfSuffix}`;
+    }
+    return `Headroom:${label} idle${perfSuffix}`;
+  };
+
+  const updateUiStatus = (
+    config: SessionConfig,
+    ctx: ExtensionContext,
+    currentModel: ModelSnapshot | null,
+  ): void => {
+    if (!config.ui?.enableFooter) {
+      return;
+    }
+    try {
+      ctx.ui?.setStatus?.(STATUS_SLOT, activeStatusLine(config, currentModel));
+    } catch {
+      // Footer status is best-effort only.
+    }
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -276,7 +500,32 @@ export default function (pi: ExtensionAPI) {
         // pi may treat unregistering an unmanaged provider as a no-op.
       }
     }
-    pi.registerProvider(providerId, { baseUrl: managedConfig.routedBaseUrl });
+
+    if (providerId === "github-copilot") {
+      const oauthProvider = githubCopilotOAuthProvider as CopilotOAuthProvider;
+      pi.registerProvider("github-copilot", {
+        baseUrl: managedConfig.routedBaseUrl,
+        oauth: {
+          name: "GitHub Copilot via Headroom",
+          login: oauthProvider.login,
+          refreshToken: oauthProvider.refreshToken,
+          getApiKey: oauthProvider.getApiKey,
+          modifyModels(models: ProviderModel[], credentials: unknown) {
+            const oauthAdjusted = oauthProvider.modifyModels
+              ? oauthProvider.modifyModels(models, credentials)
+              : models;
+            return oauthAdjusted.map((model) =>
+              model.provider === "github-copilot"
+                ? { ...model, baseUrl: managedConfig.routedBaseUrl }
+                : model,
+            );
+          },
+        },
+      });
+    } else {
+      pi.registerProvider(providerId, { baseUrl: managedConfig.routedBaseUrl });
+    }
+
     registeredProviders.set(providerId, managedConfig.routedBaseUrl);
     healthState.hasEverAttached = true;
     await logEvent(config, "provider_registered", {
@@ -343,6 +592,7 @@ export default function (pi: ExtensionAPI) {
       resolution.source,
       healthState,
     );
+    await refreshPerfSummary(providerId, managedConfig);
   };
 
   pi.on("session_start", async (event, ctx) => {
@@ -354,9 +604,10 @@ export default function (pi: ExtensionAPI) {
       sessionConfigPath: process.env.HEADROOM_PI_SESSION_CONFIG,
     });
     await syncCurrentProvider(config, currentModel, "session_start");
+    updateUiStatus(config, ctx, currentModel);
   });
 
-  pi.on("model_select", async (event) => {
+  pi.on("model_select", async (event, ctx) => {
     const config = await loadConfig();
     const currentModel = getModelSnapshot(event.model);
     await logEvent(config, "model_select", {
@@ -365,17 +616,22 @@ export default function (pi: ExtensionAPI) {
       previousModel: getModelSnapshot(event.previousModel),
     });
     await syncCurrentProvider(config, currentModel, "model_select");
+    updateUiStatus(config, ctx, currentModel);
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const config = await loadConfig();
-    await syncCurrentProvider(config, getCurrentModel(ctx), "before_agent_start");
+    const currentModel = getCurrentModel(ctx);
+    await syncCurrentProvider(config, currentModel, "before_agent_start");
+    updateUiStatus(config, ctx, currentModel);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
     const config = await loadConfig();
+    const currentModel = getCurrentModel(ctx);
     await logEvent(config, "agent_end", {
-      currentModel: getCurrentModel(ctx),
+      currentModel,
     });
+    updateUiStatus(config, ctx, currentModel);
   });
 }

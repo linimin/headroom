@@ -605,6 +605,22 @@ def _build_phase0_probe_script(
               res.end(JSON.stringify({ ok: true, label }));
               return;
             }
+            if (req.url?.startsWith("/stats")) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  persistent_savings: {
+                    lifetime: {
+                      requests: 7,
+                      tokens_saved: 19600000,
+                      compression_savings_usd: 48.9,
+                      total_input_tokens: 75400000,
+                    },
+                  },
+                }),
+              );
+              return;
+            }
 
             const rawBody = await readBody(req);
             const body = JSON.parse(rawBody);
@@ -927,6 +943,22 @@ def _build_dynamic_routing_probe_script(
               res.end(JSON.stringify({ ok: true, label }));
               return;
             }
+            if (req.url?.startsWith("/stats")) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  persistent_savings: {
+                    lifetime: {
+                      requests: 9,
+                      tokens_saved: 19600000,
+                      compression_savings_usd: 48.9,
+                      total_input_tokens: 75400000,
+                    },
+                  },
+                }),
+              );
+              return;
+            }
 
             const rawBody = await readBody(req);
             const body = JSON.parse(rawBody);
@@ -973,6 +1005,22 @@ def _build_dynamic_routing_probe_script(
             if (req.url === "/health" || req.url === "/readyz" || req.url === "/livez") {
               res.writeHead(200, { "content-type": "application/json" });
               res.end(JSON.stringify({ ok: true, label }));
+              return;
+            }
+            if (req.url?.startsWith("/stats")) {
+              res.writeHead(200, { "content-type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  persistent_savings: {
+                    lifetime: {
+                      requests: 5,
+                      tokens_saved: 8700000,
+                      compression_savings_usd: 21.5,
+                      total_input_tokens: 33000000,
+                    },
+                  },
+                }),
+              );
               return;
             }
 
