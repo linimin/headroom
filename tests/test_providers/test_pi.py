@@ -98,6 +98,8 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "Headroom:" in packaged_template
     assert "/stats?cached=1" in packaged_template
     assert "tokensSaved" in packaged_template
+    assert "headroom-status" in packaged_template
+    assert "Dashboard:" in packaged_template
 
 
 def test_render_pi_extension_copies_packaged_template(tmp_path: Path) -> None:

@@ -80,6 +80,7 @@ interface ProviderHealthState {
 const HEALTH_PATHS = ["/health", "/readyz", "/livez"];
 const MANAGED_PROVIDER_PREFIXES = ["openai", "anthropic", "github-copilot"];
 const STATUS_SLOT = "headroom-wrap-pi";
+const STATUS_COMMAND = "headroom-status";
 
 export default function (pi: ExtensionAPI) {
   const registeredProviders = new Map<string, string>();
@@ -105,6 +106,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   const getCurrentModel = (ctx: ExtensionContext): ModelSnapshot | null => getModelSnapshot(ctx.model);
+
+  const dashboardUrl = (managedConfig: SessionProviderConfig): string =>
+    `${managedConfig.rootUrl}/dashboard`;
 
   const loadConfig = async (): Promise<SessionConfig> => {
     const configPath = process.env.HEADROOM_PI_SESSION_CONFIG;
@@ -483,6 +487,66 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const notifyUi = (
+    ctx: ExtensionContext,
+    message: string,
+    level: "info" | "warn" | "error" = "info",
+  ): void => {
+    try {
+      ctx.ui?.notify?.(message, level);
+    } catch {
+      // Command output is best-effort only.
+    }
+  };
+
+  const statusLines = (
+    config: SessionConfig,
+    currentModel: ModelSnapshot | null,
+  ): string[] => {
+    const resolution = getResolution(currentModel);
+    const providerId = resolution.providerId;
+    if (!providerId || !config.providers[providerId]) {
+      return [
+        "Headroom: off",
+        "No managed provider is currently selected.",
+      ];
+    }
+
+    const managedConfig = config.providers[providerId];
+    const perf = providerPerf.get(providerId);
+    const healthState = providerHealth.get(providerId);
+    const attached = registeredProviders.has(providerId);
+    return [
+      `Provider: ${providerId}`,
+      `Status: ${attached ? "running" : healthState?.status ?? "idle"}`,
+      `Routed base URL: ${managedConfig.routedBaseUrl}`,
+      `Proxy root URL: ${managedConfig.rootUrl}`,
+      `Dashboard: ${dashboardUrl(managedConfig)}`,
+      `Lifetime tokens saved: ${perf ? formatCompactMetric(perf.tokensSaved) : "(unavailable)"}`,
+      `Lifetime compression savings: ${typeof perf?.savingsUsd === "number" ? formatCompactUsd(perf.savingsUsd) : "(unavailable)"}`,
+      `Savings percent: ${perf ? formatSavingsPercent(perf.savingsPercent) : "(unavailable)"}`,
+      `Footer: ${activeStatusLine(config, currentModel)}`,
+    ];
+  };
+
+  const registerCommands = (piApi: ExtensionAPI): void => {
+    piApi.registerCommand(STATUS_COMMAND, {
+      description:
+        "Show Headroom routing, proxy status, lifetime savings, and dashboard URL for the current managed provider.",
+      handler: async (_args: string, ctx: ExtensionContext) => {
+        const config = await loadConfig();
+        const currentModel = getCurrentModel(ctx);
+        const resolution = getResolution(currentModel);
+        const providerId = resolution.providerId;
+        if (providerId && config.providers[providerId]) {
+          await syncCurrentProvider(config, currentModel, "headroom_status_command");
+        }
+        updateUiStatus(config, ctx, currentModel);
+        notifyUi(ctx, statusLines(config, currentModel).join("\n"), "info");
+      },
+    });
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -594,6 +658,8 @@ export default function (pi: ExtensionAPI) {
     );
     await refreshPerfSummary(providerId, managedConfig);
   };
+
+  registerCommands(pi);
 
   pi.on("session_start", async (event, ctx) => {
     const config = await loadConfig();
