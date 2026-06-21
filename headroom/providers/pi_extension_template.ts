@@ -42,11 +42,13 @@ interface SessionConfig {
 interface ModelSnapshot {
   provider: string | null;
   id: string;
+  api: string | null;
 }
 
 interface ProviderModel {
   provider: string;
   id?: string;
+  api?: string;
   baseUrl?: string;
   [key: string]: unknown;
 }
@@ -97,13 +99,14 @@ export default function (pi: ExtensionAPI) {
     return normalized || null;
   };
 
-  const getModelSnapshot = (model: { provider?: string; id?: string } | null | undefined): ModelSnapshot | null => {
+  const getModelSnapshot = (model: { provider?: string; id?: string; api?: string } | null | undefined): ModelSnapshot | null => {
     if (!model || typeof model.id !== "string" || !model.id.trim()) {
       return null;
     }
     return {
       provider: normalizeProvider(model.provider),
       id: model.id,
+      api: typeof model.api === "string" ? model.api : null,
     };
   };
 
@@ -571,6 +574,22 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  const routedBaseUrlForModel = (
+    providerId: string,
+    managedConfig: SessionProviderConfig,
+    model: { api?: string | null; id?: string | null } | null,
+  ): string => {
+    if (providerId !== "github-copilot") {
+      return managedConfig.routedBaseUrl;
+    }
+    const api = (model?.api ?? "").trim().toLowerCase();
+    const modelId = (model?.id ?? "").trim().toLowerCase();
+    if (api === "anthropic-messages" || modelId.startsWith("claude") || modelId.includes("claude-")) {
+      return managedConfig.rootUrl;
+    }
+    return managedConfig.routedBaseUrl;
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -580,6 +599,7 @@ export default function (pi: ExtensionAPI) {
     resolutionSource: ResolutionSource,
     healthState: ProviderHealthState,
   ): Promise<void> => {
+    const effectiveBaseUrl = routedBaseUrlForModel(providerId, managedConfig, currentModel);
     const existingBaseUrl = registeredProviders.get(providerId);
     if (existingBaseUrl !== undefined) {
       try {
@@ -592,7 +612,7 @@ export default function (pi: ExtensionAPI) {
     if (providerId === "github-copilot") {
       const oauthProvider = githubCopilotOAuthProvider as CopilotOAuthProvider;
       pi.registerProvider("github-copilot", {
-        baseUrl: managedConfig.routedBaseUrl,
+        baseUrl: effectiveBaseUrl,
         oauth: {
           name: "GitHub Copilot via Headroom",
           login: oauthProvider.login,
@@ -604,23 +624,26 @@ export default function (pi: ExtensionAPI) {
               : models;
             return oauthAdjusted.map((model) =>
               model.provider === "github-copilot"
-                ? { ...model, baseUrl: managedConfig.routedBaseUrl }
+                ? {
+                    ...model,
+                    baseUrl: routedBaseUrlForModel("github-copilot", managedConfig, model),
+                  }
                 : model,
             );
           },
         },
       });
     } else {
-      pi.registerProvider(providerId, { baseUrl: managedConfig.routedBaseUrl });
+      pi.registerProvider(providerId, { baseUrl: effectiveBaseUrl });
     }
 
-    registeredProviders.set(providerId, managedConfig.routedBaseUrl);
+    registeredProviders.set(providerId, effectiveBaseUrl);
     healthState.hasEverAttached = true;
     await logEvent(config, "provider_registered", {
       providerId,
-      baseUrl: managedConfig.routedBaseUrl,
+      baseUrl: effectiveBaseUrl,
       previousBaseUrl: existingBaseUrl ?? null,
-      reapplied: existingBaseUrl === managedConfig.routedBaseUrl,
+      reapplied: existingBaseUrl === effectiveBaseUrl,
       reason,
       currentModel,
       resolutionSource,
