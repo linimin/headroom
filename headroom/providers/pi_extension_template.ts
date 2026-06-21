@@ -486,7 +486,7 @@ export default function (pi: ExtensionAPI) {
     config: SessionConfig,
     providerId: string,
     currentModel: ModelSnapshot | null,
-    options?: { force?: boolean },
+    options?: { force?: boolean; ctx?: ExtensionContext },
   ): Promise<SessionConfig> => {
     const existing = config.providers[providerId];
     const needsMaterialize = config.autoManageCurrentProviderOnly && !existing;
@@ -497,8 +497,16 @@ export default function (pi: ExtensionAPI) {
       !!desiredVariant &&
       !existing.variants?.[desiredVariant];
     const force = options?.force === true;
+    const ctx = options?.ctx;
     if ((!force && !needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
       return config;
+    }
+
+    if (ctx && !force && (needsMaterialize || needsCopilotVariantHydration)) {
+      const label = providerLabel(providerId, currentModel);
+      setStatusText(ctx, startupStatusLine(providerId));
+      notifyUiSoon(ctx, `Headroom starting ${label}...`, "info", 0);
+      await yieldToUi();
     }
 
     const maxEnsureAttempts = force ? 8 : 1;
@@ -704,17 +712,26 @@ export default function (pi: ExtensionAPI) {
     model: { api?: string | null; id?: string | null } | null,
   ): string => resolveProviderTargetConfig(providerId, managedConfig, model).routedBaseUrl;
 
-  const selfHealLabel = (
+  const providerLabel = (
     providerId: string,
-    targetConfig: SessionProviderRouteConfig,
     currentModel: ModelSnapshot | null,
+    fallbackFamily?: string,
   ): string => {
     if (providerId !== "github-copilot") {
       return providerId;
     }
-    const variantKey = desiredVariantKeyForModel(providerId, currentModel) ?? targetConfig.family;
+    const variantKey = desiredVariantKeyForModel(providerId, currentModel) ?? fallbackFamily ?? "openai";
     return `${providerId} (${variantKey})`;
   };
+
+  const selfHealLabel = (
+    providerId: string,
+    targetConfig: SessionProviderRouteConfig,
+    currentModel: ModelSnapshot | null,
+  ): string => providerLabel(providerId, currentModel, targetConfig.family);
+
+  const startupStatusLine = (providerId: string): string =>
+    `Headroom:${shortProviderLabel(providerId)} start`;
 
   const selfHealStatusLine = (providerId: string): string =>
     `Headroom:${shortProviderLabel(providerId)} recover`;
@@ -889,7 +906,9 @@ export default function (pi: ExtensionAPI) {
 
     let workingConfig = config;
     if (workingConfig.managedProviders.includes(providerId)) {
-      workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel);
+      workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel, {
+        ctx,
+      });
     }
 
     let managedConfig = workingConfig.providers[providerId];

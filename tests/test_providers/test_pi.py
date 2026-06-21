@@ -158,7 +158,9 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "Variant:" in packaged_template
     assert "Ownership:" in packaged_template
     assert "Headroom took over" in packaged_template
+    assert "Headroom starting" in packaged_template
     assert "Headroom reconnecting" in packaged_template
+    assert "startupStatusLine" in packaged_template
     assert "notifyUiSoon" in packaged_template
     assert "yieldToUi" in packaged_template
     assert "waitForRecoveredHealth" in packaged_template
