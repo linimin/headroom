@@ -862,6 +862,8 @@ export default function (pi: ExtensionAPI) {
         managedConfig = healedManagedConfig;
         targetConfig = resolveProviderTargetConfig(providerId, healedManagedConfig, currentModel);
         const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned";
+        const routeChanged =
+          previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership;
         healthState = await waitForRecoveredHealth(
           workingConfig,
           providerId,
@@ -889,10 +891,10 @@ export default function (pi: ExtensionAPI) {
         if (ctx && healthState.status === "healthy") {
           if (tookOver) {
             notifyUiSoon(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
-          } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
+          } else if (routeChanged) {
             notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
           }
-        } else if (ctx && healthState.status === "unavailable") {
+        } else if (ctx && healthState.status === "unavailable" && !routeChanged) {
           notifyUiSoon(ctx, `Headroom could not recover ${label}.`, "warn");
         }
       }
