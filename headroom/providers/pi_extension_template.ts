@@ -269,7 +269,10 @@ export default function (pi: ExtensionAPI) {
     if (probeResult.ok) {
       state.lastFailure = null;
       state.consecutiveFailures = 0;
-      if (previousStatus === "unavailable") {
+      if (managedConfig.ownership === "owned") {
+        state.consecutiveSuccesses = Math.max(state.consecutiveSuccesses + 1, reattachSuccesses);
+        state.status = "healthy";
+      } else if (previousStatus === "unavailable") {
         state.consecutiveSuccesses += 1;
         if (state.consecutiveSuccesses >= reattachSuccesses) {
           state.status = "healthy";

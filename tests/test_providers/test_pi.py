@@ -148,6 +148,7 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "Headroom reconnecting" in packaged_template
     assert "notifyUiSoon" in packaged_template
     assert "yieldToUi" in packaged_template
+    assert 'managedConfig.ownership === "owned"' in packaged_template
     assert "anthropic-messages" in packaged_template
     assert "rootUrl" in packaged_template
     assert "variants?.anthropic" in packaged_template
