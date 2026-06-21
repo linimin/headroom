@@ -180,6 +180,7 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
         "anthropic",
         "github-copilot",
     ]
+    assert captured["session_config"]["providers"] == {}
     assert captured["session_config"]["autoManageCurrentProviderOnly"] is True
     assert captured["session_config"]["controlUrl"].startswith("http://127.0.0.1:")
 

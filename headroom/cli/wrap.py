@@ -5437,6 +5437,8 @@ def pi(
             )
             for proxy in proxies:
                 session_config["providers"][proxy.provider_id]["ownership"] = proxy.ownership
+            if not providers:
+                session_config["providers"] = {}
             session_config_path = _write_pi_session_config(temp_dir, session_config)
             if not providers:
                 control_server = _PiWrapControlServer(
