@@ -5298,6 +5298,7 @@ class _PiWrapControlServer:
         model_api: str | None = None,
         model_id: str | None = None,
     ) -> _PiManagedProxy:
+        replaced_stale_proxy = False
         for index, proxy in enumerate(self._proxies):
             if proxy.provider_id != provider_id or proxy.variant != variant:
                 continue
@@ -5305,12 +5306,14 @@ class _PiWrapControlServer:
                 if proxy.ownership == "owned" and proxy.process is not None:
                     _cleanup_pi_wrap_session(None, [proxy])
                 del self._proxies[index]
+                replaced_stale_proxy = True
                 break
             if proxy.backend == backend and proxy.family == family:
                 return proxy
             if proxy.ownership == "owned" and proxy.process is not None:
                 _cleanup_pi_wrap_session(None, [proxy])
                 del self._proxies[index]
+                replaced_stale_proxy = True
                 break
             raise click.ClickException(
                 f"Existing attached proxy for {provider_id!r}"
@@ -5318,20 +5321,31 @@ class _PiWrapControlServer:
                 f"cannot switch to backend={backend!r}, family={family!r} on the same port."
             )
 
-        proxy = _start_or_attach_pi_proxy(
-            provider_id,
-            port,
-            backend=backend,
-            family=family,
-            memory=self._memory,
-            verbose=self._verbose,
-            model_api=model_api,
-            model_id=model_id,
-            variant=variant,
-            announce=False,
-        )
-        self._proxies.append(proxy)
-        return proxy
+        deadline = time.monotonic() + 3.0 if replaced_stale_proxy else time.monotonic()
+        while True:
+            try:
+                proxy = _start_or_attach_pi_proxy(
+                    provider_id,
+                    port,
+                    backend=backend,
+                    family=family,
+                    memory=self._memory,
+                    verbose=self._verbose,
+                    model_api=model_api,
+                    model_id=model_id,
+                    variant=variant,
+                    announce=False,
+                )
+                self._proxies.append(proxy)
+                return proxy
+            except click.ClickException as exc:
+                if not replaced_stale_proxy:
+                    raise
+                if "attach compatibility could not be proven" not in str(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
 
     def ensure_provider(
         self,

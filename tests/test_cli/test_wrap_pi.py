@@ -521,6 +521,50 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
     assert proxies[0].process is not None
 
 
+def test_pi_wrap_control_server_retries_stale_attached_takeover_until_port_releases(
+    tmp_path: Path,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, _main = wrap_modules
+    session_config = wrap_cli._build_pi_wrap_session_config(["openai"], {"openai": 8789})
+    session_config_path = tmp_path / "session.json"
+    session_config_path.write_text(json.dumps(session_config, indent=2) + "\n", encoding="utf-8")
+    proxies = [wrap_cli._PiManagedProxy("openai", 8789, "attached", "openai", "openai")]
+    missing_probe = SimpleNamespace(status="missing", reason="down", metadata=None)
+    owned_proxy = wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", _FakeManagedProcess())
+    start_calls: list[int] = []
+
+    def fake_start_or_attach(*args, **kwargs):
+        start_calls.append(1)
+        if len(start_calls) == 1:
+            raise click.ClickException(
+                "Port 8789 is already in use for pi provider 'openai', but attach compatibility could not be proven via /headroom/meta."
+            )
+        return owned_proxy
+
+    monkeypatch.setattr(wrap_cli.time, "sleep", lambda _seconds: None)
+    with patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=missing_probe), patch(
+        "headroom.cli.wrap._start_or_attach_pi_proxy", side_effect=fake_start_or_attach
+    ):
+        control_server = wrap_cli._PiWrapControlServer(
+            session_config_path=session_config_path,
+            session_config=session_config,
+            proxies=proxies,
+            provider_ports={"openai": 8789},
+            provider_variant_ports={},
+            provider_variant_backends={},
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+        try:
+            provider_payload = control_server.ensure_provider("openai")
+        finally:
+            control_server.close()
+
+    assert len(start_calls) == 2
+    assert provider_payload["ownership"] == "owned"
 def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
