@@ -5268,6 +5268,16 @@ class _PiWrapControlServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
+    def _proxy_entry_is_live(self, proxy: _PiManagedProxy) -> bool:
+        probe = _probe_pi_attach_compatibility(
+            proxy.provider_id,
+            proxy.port,
+            backend=proxy.backend,
+            memory=self._memory,
+            expected_family=proxy.family,
+        )
+        return probe.status == "compatible"
+
     def _ensure_proxy(
         self,
         provider_id: str,
@@ -5282,6 +5292,11 @@ class _PiWrapControlServer:
         for index, proxy in enumerate(self._proxies):
             if proxy.provider_id != provider_id or proxy.variant != variant:
                 continue
+            if not self._proxy_entry_is_live(proxy):
+                if proxy.ownership == "owned" and proxy.process is not None:
+                    _cleanup_pi_wrap_session(None, [proxy])
+                del self._proxies[index]
+                break
             if proxy.backend == backend and proxy.family == family:
                 return proxy
             if proxy.ownership == "owned" and proxy.process is not None:

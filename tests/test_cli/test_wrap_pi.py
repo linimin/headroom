@@ -451,6 +451,44 @@ def test_start_or_attach_pi_proxy_rejects_incompatible_attach(
             )
 
 
+def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
+    tmp_path: Path,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+    session_config = wrap_cli._build_pi_wrap_session_config(["openai"], {"openai": 8789})
+    session_config_path = tmp_path / "session.json"
+    session_config_path.write_text(json.dumps(session_config, indent=2) + "\n", encoding="utf-8")
+    proxies = [wrap_cli._PiManagedProxy("openai", 8789, "attached", "openai", "openai")]
+    missing_probe = SimpleNamespace(status="missing", reason="down", metadata=None)
+
+    with (
+        patch("headroom.cli.wrap._probe_pi_attach_compatibility", side_effect=[missing_probe, missing_probe]),
+        patch("headroom.cli.wrap._port_bind_error", return_value=None),
+        patch("headroom.cli.wrap._start_proxy", return_value=_FakeManagedProcess()),
+    ):
+        control_server = wrap_cli._PiWrapControlServer(
+            session_config_path=session_config_path,
+            session_config=session_config,
+            proxies=proxies,
+            provider_ports={"openai": 8789},
+            provider_variant_ports={},
+            provider_variant_backends={},
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+        try:
+            provider_payload = control_server.ensure_provider("openai")
+        finally:
+            control_server.close()
+
+    assert provider_payload["ownership"] == "owned"
+    assert len(proxies) == 1
+    assert proxies[0].ownership == "owned"
+    assert proxies[0].process is not None
+
+
 def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     wrap_modules: tuple[types.ModuleType, click.Group],
     monkeypatch: pytest.MonkeyPatch,
