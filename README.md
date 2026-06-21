@@ -262,7 +262,7 @@ Parity rules for the current release:
 
 - `--provider` is repeatable; omit it to lazy-manage the three supported providers on demand.
 - `--port` is valid only when exactly one provider is managed. Multi-provider runs use canonical default ports.
-- `github-copilot` preserves pi's native OAuth flow and routes both OpenAI-wire and Anthropic-wire models through separate managed local variants. Anthropic-wire Copilot models use a companion local port automatically.
+- `github-copilot` preserves pi's native OAuth flow and routes both OpenAI-wire and Anthropic-wire models through separate managed local variants. Anthropic-wire Copilot models use a companion local port automatically and start on demand instead of adding a second eager startup cost to every session.
 - If a compatible Headroom proxy is already running on the needed port, `headroom wrap pi` attaches instead of restarting it. Incompatible proxies are rejected before launch.
 - If an attached proxy owner exits mid-session, surviving `wrap pi` sessions can self-heal: they reconnect in the pi UI, take over the needed provider port, and keep routing through Headroom.
 - `/headroom-status` reports the current provider, ownership (`attached` vs `owned`), backend family, routed/root URLs, dashboard URL, and savings summary.

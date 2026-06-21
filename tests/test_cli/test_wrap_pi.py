@@ -197,7 +197,7 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
     assert captured["session_config"]["controlUrl"].startswith("http://127.0.0.1:")
 
 
-def test_wrap_pi_explicit_copilot_session_config_includes_dual_family_variants(
+def test_wrap_pi_explicit_copilot_session_config_eager_starts_only_openai_variant(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
@@ -213,16 +213,7 @@ def test_wrap_pi_explicit_copilot_session_config_includes_dual_family_variants(
                 "openai",
                 "openai",
                 variant="openai",
-            ),
-            wrap_cli._PiManagedProxy(
-                "github-copilot",
-                9912,
-                "owned",
-                "anthropic",
-                "anthropic",
-                _FakeManagedProcess(),
-                "anthropic",
-            ),
+            )
         ]
 
     def fake_popen(command: list[str], env: dict[str, str], start_new_session: bool):
@@ -247,10 +238,7 @@ def test_wrap_pi_explicit_copilot_session_config_includes_dual_family_variants(
     copilot = captured["session_config"]["providers"]["github-copilot"]
     assert copilot["variants"]["openai"]["port"] == 9911
     assert copilot["variants"]["openai"]["ownership"] == "attached"
-    assert copilot["variants"]["anthropic"]["port"] == 9912
-    assert copilot["variants"]["anthropic"]["ownership"] == "owned"
-    assert copilot["variants"]["anthropic"]["backend"] == "anthropic"
-    assert copilot["variants"]["anthropic"]["family"] == "anthropic"
+    assert "anthropic" not in copilot["variants"]
 
 
 def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
@@ -549,6 +537,82 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
     assert proxies[0].process is not None
 
 
+def test_pi_wrap_control_server_starts_copilot_anthropic_variant_on_demand(
+    tmp_path: Path,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+    openai_proxy = wrap_cli._PiManagedProxy(
+        "github-copilot", 8788, "owned", "openai", "openai", _FakeManagedProcess(), "openai"
+    )
+    proxies = [openai_proxy]
+    session_config = wrap_cli._build_pi_wrap_session_config(
+        ["github-copilot"],
+        {"github-copilot": 8788},
+        provider_variant_ports={"github-copilot": {"openai": 8788, "anthropic": 8791}},
+        provider_variant_backends={
+            "github-copilot": {"openai": "openai", "anthropic": "anthropic"}
+        },
+    )
+    session_config["providers"]["github-copilot"] = wrap_cli._build_pi_session_provider_payload(
+        "github-copilot",
+        provider_ports={"github-copilot": 8788},
+        provider_variant_ports={"github-copilot": {"openai": 8788, "anthropic": 8791}},
+        provider_variant_backends={
+            "github-copilot": {"openai": "openai", "anthropic": "anthropic"}
+        },
+        proxies=proxies,
+    )
+    session_config_path = tmp_path / "session.json"
+    session_config_path.write_text(json.dumps(session_config, indent=2) + "\n", encoding="utf-8")
+    compatible_probe = SimpleNamespace(status="compatible", reason="ok", metadata=None)
+    start_calls: list[dict[str, object]] = []
+
+    def fake_start_or_attach(provider_id: str, port: int, **kwargs):
+        start_calls.append({"provider_id": provider_id, "port": port, **kwargs})
+        return wrap_cli._PiManagedProxy(
+            provider_id,
+            port,
+            "owned",
+            str(kwargs["backend"]),
+            str(kwargs["family"]),
+            _FakeManagedProcess(),
+            kwargs.get("variant"),
+        )
+
+    with (
+        patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=compatible_probe),
+        patch("headroom.cli.wrap._start_or_attach_pi_proxy", side_effect=fake_start_or_attach),
+    ):
+        control_server = wrap_cli._PiWrapControlServer(
+            session_config_path=session_config_path,
+            session_config=session_config,
+            proxies=proxies,
+            provider_ports={"github-copilot": 8788},
+            provider_variant_ports={"github-copilot": {"openai": 8788, "anthropic": 8791}},
+            provider_variant_backends={
+                "github-copilot": {"openai": "openai", "anthropic": "anthropic"}
+            },
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+        try:
+            provider_payload = control_server.ensure_provider(
+                "github-copilot",
+                model_api="anthropic-messages",
+                model_id="claude-opus-4.6",
+            )
+        finally:
+            control_server.close()
+
+    assert [(call["port"], call["variant"], call["family"]) for call in start_calls] == [
+        (8791, "anthropic", "anthropic")
+    ]
+    assert provider_payload["variants"]["openai"]["ownership"] == "owned"
+    assert provider_payload["variants"]["anthropic"]["ownership"] == "owned"
+
+
 def test_pi_wrap_control_server_retries_stale_attached_takeover_until_port_releases(
     tmp_path: Path,
     wrap_modules: tuple[types.ModuleType, click.Group],
@@ -634,7 +698,7 @@ def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     assert all(pid != attached_proc.pid for pid, _signum in calls)
 
 
-def test_start_pi_managed_proxies_starts_copilot_openai_and_anthropic_variants(
+def test_start_pi_managed_proxies_eager_starts_only_copilot_openai_variant(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
     wrap_cli, _main = wrap_modules
@@ -663,11 +727,9 @@ def test_start_pi_managed_proxies_starts_copilot_openai_and_anthropic_variants(
 
     assert [(proxy.port, proxy.variant, proxy.backend, proxy.family) for proxy in proxies] == [
         (8788, "openai", "openai", "openai"),
-        (8789, "anthropic", "anthropic", "anthropic"),
     ]
     assert [(call["port"], call["variant"], call["backend"], call["family"]) for call in calls] == [
         (8788, "openai", "openai", "openai"),
-        (8789, "anthropic", "anthropic", "anthropic"),
     ]
 
 

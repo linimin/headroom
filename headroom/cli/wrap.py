@@ -129,9 +129,6 @@ from headroom.providers.opencode.config import (
 from headroom.providers.pi import (
     PI_SUPPORTED_PROVIDERS as _PI_SUPPORTED_PROVIDERS,
 )
-from headroom.providers.pi import (
-    build_pi_copilot_provider_payload as _build_pi_copilot_provider_payload,
-)
 from headroom.providers.pi import build_pi_launch_args as _build_pi_launch_args
 from headroom.providers.pi import build_pi_launch_env as _build_pi_launch_env
 from headroom.providers.pi import build_pi_provider_payload as _build_pi_provider_payload
@@ -5163,29 +5160,40 @@ def _build_pi_session_provider_payload(
     if provider_id == "github-copilot" and provider_id in provider_variant_ports:
         variant_ports = provider_variant_ports[provider_id]
         variant_backends = provider_variant_backends.get(provider_id, {})
-        payload = _build_pi_copilot_provider_payload(
-            openai_port=variant_ports.get("openai", provider_ports[provider_id]),
-            anthropic_port=variant_ports.get("anthropic", provider_ports[provider_id]),
-            openai_backend=variant_backends.get("openai"),
-            anthropic_backend=variant_backends.get("anthropic"),
-        )
-        variants = cast(dict[str, dict[str, Any]], payload.get("variants", {}))
-        default_variant = str(payload.get("defaultVariant") or "openai")
-        for proxy in proxies:
-            if (
-                proxy.provider_id != provider_id
-                or not proxy.variant
-                or proxy.variant not in variants
-            ):
+        started_variants: dict[str, _PiManagedProxy] = {
+            proxy.variant: proxy
+            for proxy in proxies
+            if proxy.provider_id == provider_id and proxy.variant is not None
+        }
+        variants: dict[str, dict[str, Any]] = {}
+        for variant_name in ("openai", "anthropic"):
+            proxy = started_variants.get(variant_name)
+            if proxy is None:
                 continue
-            variant_payload = variants[proxy.variant]
+            variant_payload = _build_pi_provider_payload(
+                provider_id,
+                variant_ports.get(variant_name, provider_ports[provider_id]),
+                backend=variant_backends.get(variant_name),
+                family=variant_name,
+            )
             variant_payload["ownership"] = proxy.ownership
             variant_payload["backend"] = proxy.backend
             variant_payload["family"] = proxy.family
-            if proxy.variant == default_variant:
-                payload["ownership"] = proxy.ownership
-                payload["backend"] = proxy.backend
-                payload["family"] = proxy.family
+            variants[variant_name] = variant_payload
+
+        fallback_payload = (
+            variants.get("openai")
+            or variants.get("anthropic")
+            or _build_pi_provider_payload(
+                provider_id,
+                variant_ports.get("openai", provider_ports[provider_id]),
+                backend=variant_backends.get("openai"),
+                family="openai",
+            )
+        )
+        payload = dict(fallback_payload)
+        payload["defaultVariant"] = "openai"
+        payload["variants"] = variants
         return payload
 
     payload = _build_pi_provider_payload(
@@ -5358,27 +5366,38 @@ class _PiWrapControlServer:
         model_api: str | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        del model_api, model_id  # Session-scoped provider materialization is provider-centric.
         with self._lock:
             if provider_id == "github-copilot" and provider_id in self._provider_variant_ports:
                 variant_ports = self._provider_variant_ports[provider_id]
                 variant_backends = self._provider_variant_backends.get(provider_id, {})
-                self._ensure_proxy(
-                    provider_id,
-                    port=variant_ports.get("openai", self._provider_ports[provider_id]),
-                    backend=variant_backends.get("openai", "openai"),
-                    family="openai",
-                    variant="openai",
+                desired_variant = (
+                    "anthropic"
+                    if _resolve_pi_provider_family(
+                        provider_id,
+                        model_api=model_api,
+                        model_id=model_id,
+                    )
+                    == "anthropic"
+                    else "openai"
                 )
-                self._ensure_proxy(
-                    provider_id,
-                    port=variant_ports.get("anthropic", self._provider_ports[provider_id]),
-                    backend=variant_backends.get("anthropic", "anthropic"),
-                    family="anthropic",
-                    variant="anthropic",
-                    model_api="anthropic-messages",
-                    model_id="claude",
-                )
+                if desired_variant == "anthropic":
+                    self._ensure_proxy(
+                        provider_id,
+                        port=variant_ports.get("anthropic", self._provider_ports[provider_id]),
+                        backend=variant_backends.get("anthropic", "anthropic"),
+                        family="anthropic",
+                        variant="anthropic",
+                        model_api="anthropic-messages",
+                        model_id="claude",
+                    )
+                else:
+                    self._ensure_proxy(
+                        provider_id,
+                        port=variant_ports.get("openai", self._provider_ports[provider_id]),
+                        backend=variant_backends.get("openai", "openai"),
+                        family="openai",
+                        variant="openai",
+                    )
             else:
                 desired_backend = _resolve_pi_provider_backend(provider_id, self._backend)
                 desired_family = _resolve_pi_provider_family(
@@ -5591,19 +5610,6 @@ def _start_pi_managed_proxies(
                         memory=memory,
                         verbose=verbose,
                         variant="openai",
-                    )
-                )
-                proxies.append(
-                    _start_or_attach_pi_proxy(
-                        provider_id,
-                        variant_ports.get("anthropic", provider_ports[provider_id]),
-                        backend=variant_backends.get("anthropic"),
-                        family="anthropic",
-                        memory=memory,
-                        verbose=verbose,
-                        model_api="anthropic-messages",
-                        model_id="claude",
-                        variant="anthropic",
                     )
                 )
                 continue

@@ -494,11 +494,8 @@ export default function (pi: ExtensionAPI) {
     const needsCopilotVariantHydration =
       providerId === "github-copilot" &&
       !!existing &&
-      (
-        !existing.variants?.openai ||
-        !existing.variants?.anthropic ||
-        (!!desiredVariant && !existing.variants?.[desiredVariant])
-      );
+      !!desiredVariant &&
+      !existing.variants?.[desiredVariant];
     const force = options?.force === true;
     if ((!force && !needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
       return config;
