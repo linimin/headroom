@@ -374,6 +374,35 @@ def test_build_pi_provider_variant_ports_skips_reserved_primary_ports(
     ) == {"github-copilot": {"openai": 8788, "anthropic": 8791}}
 
 
+def test_start_proxy_suppresses_log_path_announcement_when_announce_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+
+    class FakeProc:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(wrap_cli, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+    echo_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        wrap_cli.click,
+        "echo",
+        lambda *args, **kwargs: echo_calls.append((args, kwargs)),
+    )
+
+    proc = wrap_cli._start_proxy(8787, agent_type="pi", announce=False)
+
+    assert isinstance(proc, FakeProc)
+    assert echo_calls == []
+
+
 def test_start_or_attach_pi_proxy_accepts_compatible_attach(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:

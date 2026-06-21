@@ -417,6 +417,7 @@ def _start_proxy(
     anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     extra_env: Mapping[str, str] | None = None,
+    announce: bool = True,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -506,7 +507,8 @@ def _start_proxy(
     for _i in range(timeout_seconds):
         time.sleep(1)
         if _check_proxy(port):
-            click.echo(f"  Logs: {log_path}")
+            if announce:
+                click.echo(f"  Logs: {log_path}")
             stdio_log_file.close()
             return proc
         # Check if process died
@@ -5521,6 +5523,7 @@ def _start_or_attach_pi_proxy(
                 backend=provider_backend,
                 family=provider_family,
             ),
+            announce=announce,
         ),
     )
     if announce and verbose:
