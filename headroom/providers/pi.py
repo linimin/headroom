@@ -135,12 +135,27 @@ def resolve_pi_proxy_backend(backend: str | None) -> str:
     return value
 
 
-def resolve_pi_provider_backend(provider_id: str, backend: str | None) -> str:
+def resolve_pi_provider_backend(
+    provider_id: str,
+    backend: str | None,
+    *,
+    model_api: str | None = None,
+    model_id: str | None = None,
+) -> str:
     """Resolve the backend a specific managed pi provider should use."""
 
     explicit = resolve_pi_proxy_backend(backend)
     if explicit:
         return explicit
+    if provider_id == "github-copilot":
+        family = resolve_pi_provider_family(
+            provider_id,
+            backend=None,
+            model_api=model_api,
+            model_id=model_id,
+        )
+        if family == "anthropic":
+            return "anthropic"
     return managed_provider_specs()[provider_id].default_backend
 
 
@@ -183,6 +198,52 @@ def resolve_provider_ports(
     return {provider_id: port_override}
 
 
+def resolve_pi_provider_family(
+    provider_id: str,
+    *,
+    backend: str | None = None,
+    model_api: str | None = None,
+    model_id: str | None = None,
+) -> str:
+    """Resolve the effective wire family a managed pi provider should use."""
+
+    spec = managed_provider_specs()[provider_id]
+    explicit = resolve_pi_proxy_backend(backend)
+    if explicit == "anthropic":
+        return "anthropic"
+    if explicit:
+        return spec.family
+    if provider_id == "github-copilot":
+        normalized_api = (model_api or "").strip().lower()
+        normalized_model_id = (model_id or "").strip().lower()
+        if normalized_api == "anthropic-messages":
+            return "anthropic"
+        if normalized_model_id.startswith("claude") or "claude-" in normalized_model_id:
+            return "anthropic"
+    return spec.family
+
+
+def build_pi_provider_payload(
+    provider_id: str,
+    port: int,
+    *,
+    backend: str | None = None,
+    family: str | None = None,
+) -> dict[str, Any]:
+    """Build one provider payload entry for `session.json`."""
+
+    spec = managed_provider_specs()[provider_id]
+    resolved_family = family or resolve_pi_provider_family(provider_id, backend=backend)
+    routed_base_url = spec.root_url(port) if resolved_family == "anthropic" else spec.routed_base_url(port)
+    return {
+        "port": port,
+        "rootUrl": spec.root_url(port),
+        "routedBaseUrl": routed_base_url,
+        "family": resolved_family,
+        "backend": resolve_pi_provider_backend(provider_id, backend, model_api=None, model_id=None),
+    }
+
+
 def build_pi_wrap_session_config(
     managed_providers: Sequence[str],
     provider_ports: Mapping[str, int],
@@ -195,20 +256,20 @@ def build_pi_wrap_session_config(
     auto_manage_current_provider_only: bool = False,
     control_url: str | None = None,
     phase0: Mapping[str, Any] | None = None,
+    provider_backends: Mapping[str, str] | None = None,
+    provider_families: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical versioned `session.json` payload for `wrap pi`."""
 
-    specs = managed_provider_specs()
     providers: dict[str, Any] = {}
     for provider_id in managed_providers:
-        spec = specs[provider_id]
         port = provider_ports[provider_id]
-        providers[provider_id] = {
-            "port": port,
-            "rootUrl": spec.root_url(port),
-            "routedBaseUrl": spec.routed_base_url(port),
-            "family": spec.family,
-        }
+        providers[provider_id] = build_pi_provider_payload(
+            provider_id,
+            port,
+            backend=(provider_backends or {}).get(provider_id),
+            family=(provider_families or {}).get(provider_id),
+        )
 
     payload: dict[str, Any] = {
         "version": 1,
@@ -317,15 +378,32 @@ def build_pi_launch_args(pi_args: Sequence[str], extension_path: Path) -> tuple[
     return (*pi_args, "--extension", str(extension_path))
 
 
-def build_pi_proxy_metadata_env(provider_id: str) -> dict[str, str]:
+def build_pi_proxy_metadata_env(
+    provider_id: str,
+    *,
+    backend: str | None = None,
+    family: str | None = None,
+) -> dict[str, str]:
     """Return proxy env vars needed for wrap-pi attach metadata and provider-specific upstreams."""
 
     spec = managed_provider_specs()[provider_id]
+    resolved_family = family or resolve_pi_provider_family(provider_id, backend=backend)
     env = {
-        PI_PROXY_METADATA_FAMILY_ENV: spec.family,
+        PI_PROXY_METADATA_FAMILY_ENV: resolved_family,
         PI_PROXY_METADATA_CAPABILITY_ENV: "1",
     }
-    if spec.proxy_env:
+    if provider_id == "github-copilot":
+        if resolved_family == "anthropic":
+            env.update(
+                {
+                    "ANTHROPIC_TARGET_API_URL": "https://api.githubcopilot.com",
+                    PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
+                    PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
+                }
+            )
+        elif spec.proxy_env:
+            env.update(spec.proxy_env)
+    elif spec.proxy_env:
         env.update(spec.proxy_env)
     return env
 
@@ -393,6 +471,7 @@ def probe_attach_compatibility(
     *,
     backend: str | None,
     memory: bool,
+    expected_family: str | None = None,
     urlopen: Any = urllib.request.urlopen,
 ) -> PiAttachProbeResult:
     """Validate whether wrap-pi may attach to a proxy already listening on a port."""
@@ -416,7 +495,7 @@ def probe_attach_compatibility(
         )
 
     expected_backend = resolve_pi_provider_backend(provider_id, backend)
-    expected_family = managed_provider_specs()[provider_id].family
+    expected_family = expected_family or resolve_pi_provider_family(provider_id, backend=backend)
     if not metadata.attach_compatible or not metadata.wrap_pi:
         reason = f"Metadata on port {port} does not advertise wrap-pi attach compatibility."
         return PiAttachProbeResult(

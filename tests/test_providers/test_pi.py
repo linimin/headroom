@@ -62,7 +62,21 @@ def test_build_pi_wrap_session_config_renders_routed_urls() -> None:
     assert config["providers"]["openai"]["routedBaseUrl"] == "http://127.0.0.1:8789/v1"
     assert config["providers"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8790"
     assert config["providers"]["github-copilot"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
+    assert config["providers"]["github-copilot"]["backend"] == "openai"
     assert config["phase0"] == {"forceNativeProviders": ["openai"]}
+
+
+def test_build_pi_provider_payload_switches_copilot_claude_to_root_url() -> None:
+    payload = pi_mod.build_pi_provider_payload(
+        "github-copilot",
+        8788,
+        backend="anthropic",
+        family="anthropic",
+    )
+    assert payload["rootUrl"] == "http://127.0.0.1:8788"
+    assert payload["routedBaseUrl"] == "http://127.0.0.1:8788"
+    assert payload["family"] == "anthropic"
+    assert payload["backend"] == "anthropic"
 
 
 def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: Path) -> None:
@@ -78,6 +92,20 @@ def test_resolve_pi_provider_backend_uses_provider_specific_defaults() -> None:
     assert pi_mod.resolve_pi_provider_backend("openai", None) == "openai"
     assert pi_mod.resolve_pi_provider_backend("anthropic", None) == "anthropic"
     assert pi_mod.resolve_pi_provider_backend("github-copilot", None) == "openai"
+
+
+def test_resolve_pi_provider_backend_switches_copilot_claude_models_to_anthropic() -> None:
+    assert pi_mod.resolve_pi_provider_backend(
+        "github-copilot",
+        None,
+        model_api="anthropic-messages",
+        model_id="claude-opus-4.6",
+    ) == "anthropic"
+    assert pi_mod.resolve_pi_provider_family(
+        "github-copilot",
+        model_api="anthropic-messages",
+        model_id="claude-opus-4.6",
+    ) == "anthropic"
 
 
 def test_resolve_pi_provider_backend_respects_explicit_override() -> None:
@@ -275,6 +303,21 @@ def test_build_pi_proxy_metadata_env_uses_provider_family_and_copilot_upstream()
         pi_mod.PI_PROXY_METADATA_FAMILY_ENV: "openai",
         pi_mod.PI_PROXY_METADATA_CAPABILITY_ENV: "1",
         pi_mod.PI_OPENAI_TARGET_API_URL_ENV: "https://api.githubcopilot.com",
+        pi_mod.PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
+        pi_mod.PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
+    }
+
+
+def test_build_pi_proxy_metadata_env_switches_copilot_claude_to_anthropic_target() -> None:
+    env = pi_mod.build_pi_proxy_metadata_env(
+        "github-copilot",
+        backend="anthropic",
+        family="anthropic",
+    )
+    assert env == {
+        pi_mod.PI_PROXY_METADATA_FAMILY_ENV: "anthropic",
+        pi_mod.PI_PROXY_METADATA_CAPABILITY_ENV: "1",
+        "ANTHROPIC_TARGET_API_URL": "https://api.githubcopilot.com",
         pi_mod.PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
         pi_mod.PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
     }
