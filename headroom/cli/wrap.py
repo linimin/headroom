@@ -5319,6 +5319,7 @@ class _PiWrapControlServer:
             model_api=model_api,
             model_id=model_id,
             variant=variant,
+            announce=False,
         )
         self._proxies.append(proxy)
         return proxy
@@ -5451,6 +5452,7 @@ def _start_or_attach_pi_proxy(
     model_api: str | None = None,
     model_id: str | None = None,
     variant: str | None = None,
+    announce: bool = True,
 ) -> _PiManagedProxy:
     """Return proxy ownership state for one managed pi provider."""
 
@@ -5474,15 +5476,16 @@ def _start_or_attach_pi_proxy(
         expected_family=provider_family,
     )
     if attach_probe.status == "compatible":
-        click.echo(f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}")
-        if verbose and attach_probe.metadata is not None:
-            click.echo(
-                "   attach metadata: "
-                f"version={attach_probe.metadata.headroom_version} "
-                f"backend={attach_probe.metadata.backend} "
-                f"family={attach_probe.metadata.upstream_family} "
-                f"memory={attach_probe.metadata.memory}"
-            )
+        if announce:
+            click.echo(f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}")
+            if verbose and attach_probe.metadata is not None:
+                click.echo(
+                    "   attach metadata: "
+                    f"version={attach_probe.metadata.headroom_version} "
+                    f"backend={attach_probe.metadata.backend} "
+                    f"family={attach_probe.metadata.upstream_family} "
+                    f"memory={attach_probe.metadata.memory}"
+                )
         return _PiManagedProxy(
             provider_id=provider_id,
             port=port,
@@ -5504,7 +5507,8 @@ def _start_or_attach_pi_proxy(
             f"could not be proven via /headroom/meta. Stop the existing process or choose a different port."
         )
 
-    click.echo(f" Starting Headroom proxy for {provider_id} on port {port}...")
+    if announce:
+        click.echo(f" Starting Headroom proxy for {provider_id} on port {port}...")
     proc = cast(
         subprocess.Popen[Any],
         _start_proxy(
@@ -5519,7 +5523,7 @@ def _start_or_attach_pi_proxy(
             ),
         ),
     )
-    if verbose:
+    if announce and verbose:
         click.echo(f"   ownership=owned backend={provider_backend}")
     return _PiManagedProxy(
         provider_id=provider_id,

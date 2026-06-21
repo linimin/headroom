@@ -466,6 +466,7 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
         patch("headroom.cli.wrap._probe_pi_attach_compatibility", side_effect=[missing_probe, missing_probe]),
         patch("headroom.cli.wrap._port_bind_error", return_value=None),
         patch("headroom.cli.wrap._start_proxy", return_value=_FakeManagedProcess()),
+        patch("headroom.cli.wrap.click.echo") as echo,
     ):
         control_server = wrap_cli._PiWrapControlServer(
             session_config_path=session_config_path,
@@ -482,6 +483,8 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
             provider_payload = control_server.ensure_provider("openai")
         finally:
             control_server.close()
+
+    echo.assert_not_called()
 
     assert provider_payload["ownership"] == "owned"
     assert len(proxies) == 1
