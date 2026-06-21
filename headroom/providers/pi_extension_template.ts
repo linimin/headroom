@@ -904,7 +904,12 @@ export default function (pi: ExtensionAPI) {
           } else if (routeChanged) {
             notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
           }
-        } else if (ctx && healthState.status === "unavailable" && !routeChanged) {
+        } else if (
+          ctx &&
+          healthState.status === "unavailable" &&
+          !routeChanged &&
+          reason === "headroom_status_command"
+        ) {
           notifyUiSoon(ctx, `Headroom could not recover ${label}.`, "warn");
         }
       }

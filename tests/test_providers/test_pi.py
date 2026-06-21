@@ -169,7 +169,7 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
         in packaged_template
     )
     assert "const routeChanged =" in packaged_template
-    assert 'healthState.status === "unavailable" && !routeChanged' in packaged_template
+    assert 'reason === "headroom_status_command"' in packaged_template
     assert "anthropic-messages" in packaged_template
     assert "rootUrl" in packaged_template
     assert "variants?.anthropic" in packaged_template
