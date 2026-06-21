@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.resources as importlib_resources
-import io
 import json
 import os
 import shutil
@@ -56,6 +55,10 @@ def test_build_pi_wrap_session_config_renders_routed_urls() -> None:
         ["openai", "anthropic", "github-copilot"],
         {"openai": 8789, "anthropic": 8790, "github-copilot": 8788},
         phase0={"forceNativeProviders": ["openai"]},
+        provider_variant_ports={"github-copilot": {"openai": 8788, "anthropic": 8791}},
+        provider_variant_backends={
+            "github-copilot": {"openai": "openai", "anthropic": "anthropic"}
+        },
     )
     assert config["version"] == 1
     assert config["managedProviders"] == ["openai", "anthropic", "github-copilot"]
@@ -63,6 +66,9 @@ def test_build_pi_wrap_session_config_renders_routed_urls() -> None:
     assert config["providers"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8790"
     assert config["providers"]["github-copilot"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
     assert config["providers"]["github-copilot"]["backend"] == "openai"
+    assert config["providers"]["github-copilot"]["variants"]["openai"]["routedBaseUrl"] == "http://127.0.0.1:8788/v1"
+    assert config["providers"]["github-copilot"]["variants"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8791"
+    assert config["providers"]["github-copilot"]["variants"]["anthropic"]["backend"] == "anthropic"
     assert config["phase0"] == {"forceNativeProviders": ["openai"]}
 
 
@@ -70,13 +76,22 @@ def test_build_pi_provider_payload_switches_copilot_claude_to_root_url() -> None
     payload = pi_mod.build_pi_provider_payload(
         "github-copilot",
         8788,
-        backend="anthropic",
         family="anthropic",
     )
     assert payload["rootUrl"] == "http://127.0.0.1:8788"
     assert payload["routedBaseUrl"] == "http://127.0.0.1:8788"
     assert payload["family"] == "anthropic"
     assert payload["backend"] == "anthropic"
+
+
+def test_build_pi_copilot_provider_payload_contains_both_wire_variants() -> None:
+    payload = pi_mod.build_pi_copilot_provider_payload(8788, 8791)
+    assert payload["defaultVariant"] == "openai"
+    assert payload["variants"]["openai"]["port"] == 8788
+    assert payload["variants"]["openai"]["backend"] == "openai"
+    assert payload["variants"]["anthropic"]["port"] == 8791
+    assert payload["variants"]["anthropic"]["backend"] == "anthropic"
+    assert payload["variants"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8791"
 
 
 def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: Path) -> None:
@@ -128,8 +143,10 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "tokensSaved" in packaged_template
     assert "headroom-status" in packaged_template
     assert "Dashboard:" in packaged_template
+    assert "Variant:" in packaged_template
     assert "anthropic-messages" in packaged_template
     assert "rootUrl" in packaged_template
+    assert "variants?.anthropic" in packaged_template
 
 
 def test_render_pi_extension_copies_packaged_template(tmp_path: Path) -> None:
@@ -335,7 +352,7 @@ class _FakeResponse:
     def __init__(self, payload: str) -> None:
         self._payload = payload
 
-    def __enter__(self) -> "_FakeResponse":
+    def __enter__(self) -> _FakeResponse:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

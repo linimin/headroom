@@ -32,8 +32,8 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from headroom._subprocess import run
@@ -128,6 +128,9 @@ from headroom.providers.opencode.config import (
 )
 from headroom.providers.pi import (
     PI_SUPPORTED_PROVIDERS as _PI_SUPPORTED_PROVIDERS,
+)
+from headroom.providers.pi import (
+    build_pi_copilot_provider_payload as _build_pi_copilot_provider_payload,
 )
 from headroom.providers.pi import build_pi_launch_args as _build_pi_launch_args
 from headroom.providers.pi import build_pi_launch_env as _build_pi_launch_env
@@ -5096,6 +5099,94 @@ class _PiManagedProxy:
     backend: str
     family: str
     process: subprocess.Popen[Any] | None = None
+    variant: str | None = None
+
+
+def _build_pi_provider_variant_ports(
+    managed_providers: Sequence[str],
+    provider_ports: Mapping[str, int],
+) -> dict[str, dict[str, int]]:
+    """Reserve per-provider companion ports for model-family variants."""
+
+    if "github-copilot" not in managed_providers:
+        return {}
+
+    reserved_ports = set(_resolve_pi_provider_ports(_PI_SUPPORTED_PROVIDERS, None).values())
+    reserved_ports.update(provider_ports.values())
+    openai_port = provider_ports["github-copilot"]
+    anthropic_port = openai_port + 1
+    while anthropic_port in reserved_ports:
+        anthropic_port += 1
+    return {
+        "github-copilot": {
+            "openai": openai_port,
+            "anthropic": anthropic_port,
+        }
+    }
+
+
+def _build_pi_provider_variant_backends(backend: str | None) -> dict[str, dict[str, str]]:
+    """Return per-variant backend selections for managed providers that need them."""
+
+    return {
+        "github-copilot": {
+            "openai": _resolve_pi_provider_backend("github-copilot", backend),
+            "anthropic": _resolve_pi_provider_backend(
+                "github-copilot",
+                backend,
+                model_api="anthropic-messages",
+                model_id="claude",
+            ),
+        }
+    }
+
+
+def _build_pi_session_provider_payload(
+    provider_id: str,
+    *,
+    provider_ports: Mapping[str, int],
+    provider_variant_ports: Mapping[str, Mapping[str, int]],
+    provider_variant_backends: Mapping[str, Mapping[str, str]],
+    proxies: Sequence[_PiManagedProxy],
+) -> dict[str, Any]:
+    """Build one session provider payload with live ownership metadata."""
+
+    if provider_id == "github-copilot" and provider_id in provider_variant_ports:
+        variant_ports = provider_variant_ports[provider_id]
+        variant_backends = provider_variant_backends.get(provider_id, {})
+        payload = _build_pi_copilot_provider_payload(
+            openai_port=variant_ports.get("openai", provider_ports[provider_id]),
+            anthropic_port=variant_ports.get("anthropic", provider_ports[provider_id]),
+            openai_backend=variant_backends.get("openai"),
+            anthropic_backend=variant_backends.get("anthropic"),
+        )
+        variants = cast(dict[str, dict[str, Any]], payload.get("variants", {}))
+        default_variant = str(payload.get("defaultVariant") or "openai")
+        for proxy in proxies:
+            if proxy.provider_id != provider_id or not proxy.variant or proxy.variant not in variants:
+                continue
+            variant_payload = variants[proxy.variant]
+            variant_payload["ownership"] = proxy.ownership
+            variant_payload["backend"] = proxy.backend
+            variant_payload["family"] = proxy.family
+            if proxy.variant == default_variant:
+                payload["ownership"] = proxy.ownership
+                payload["backend"] = proxy.backend
+                payload["family"] = proxy.family
+        return payload
+
+    payload = _build_pi_provider_payload(
+        provider_id,
+        provider_ports[provider_id],
+    )
+    for proxy in proxies:
+        if proxy.provider_id != provider_id:
+            continue
+        payload["ownership"] = proxy.ownership
+        payload["backend"] = proxy.backend
+        payload["family"] = proxy.family
+        break
+    return payload
 
 
 class _PiWrapControlServer:
@@ -5108,6 +5199,8 @@ class _PiWrapControlServer:
         session_config: dict[str, Any],
         proxies: list[_PiManagedProxy],
         provider_ports: Mapping[str, int],
+        provider_variant_ports: Mapping[str, Mapping[str, int]],
+        provider_variant_backends: Mapping[str, Mapping[str, str]],
         backend: str | None,
         memory: bool,
         verbose: bool,
@@ -5116,6 +5209,14 @@ class _PiWrapControlServer:
         self._session_config = session_config
         self._proxies = proxies
         self._provider_ports = dict(provider_ports)
+        self._provider_variant_ports = {
+            provider_id: dict(variant_ports)
+            for provider_id, variant_ports in provider_variant_ports.items()
+        }
+        self._provider_variant_backends = {
+            provider_id: dict(variant_backends)
+            for provider_id, variant_backends in provider_variant_backends.items()
+        }
         self._backend = backend
         self._memory = memory
         self._verbose = verbose
@@ -5167,6 +5268,46 @@ class _PiWrapControlServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
+    def _ensure_proxy(
+        self,
+        provider_id: str,
+        *,
+        port: int,
+        backend: str,
+        family: str,
+        variant: str | None = None,
+        model_api: str | None = None,
+        model_id: str | None = None,
+    ) -> _PiManagedProxy:
+        for index, proxy in enumerate(self._proxies):
+            if proxy.provider_id != provider_id or proxy.variant != variant:
+                continue
+            if proxy.backend == backend and proxy.family == family:
+                return proxy
+            if proxy.ownership == "owned" and proxy.process is not None:
+                _cleanup_pi_wrap_session(None, [proxy])
+                del self._proxies[index]
+                break
+            raise click.ClickException(
+                f"Existing attached proxy for {provider_id!r}"
+                f"{f' variant {variant!r}' if variant else ''} uses backend={proxy.backend!r}, family={proxy.family!r}; "
+                f"cannot switch to backend={backend!r}, family={family!r} on the same port."
+            )
+
+        proxy = _start_or_attach_pi_proxy(
+            provider_id,
+            port,
+            backend=backend,
+            family=family,
+            memory=self._memory,
+            verbose=self._verbose,
+            model_api=model_api,
+            model_id=model_id,
+            variant=variant,
+        )
+        self._proxies.append(proxy)
+        return proxy
+
     def ensure_provider(
         self,
         provider_id: str,
@@ -5174,50 +5315,47 @@ class _PiWrapControlServer:
         model_api: str | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        desired_backend = _resolve_pi_provider_backend(
-            provider_id,
-            self._backend,
-            model_api=model_api,
-            model_id=model_id,
-        )
-        desired_family = _resolve_pi_provider_family(
-            provider_id,
-            backend=desired_backend,
-            model_api=model_api,
-            model_id=model_id,
-        )
+        del model_api, model_id  # Session-scoped provider materialization is provider-centric.
         with self._lock:
-            for index, proxy in enumerate(self._proxies):
-                if proxy.provider_id != provider_id:
-                    continue
-                if proxy.backend == desired_backend and proxy.family == desired_family:
-                    return cast(dict[str, Any], self._session_config["providers"][provider_id])
-                if proxy.ownership == "owned" and proxy.process is not None:
-                    _cleanup_pi_wrap_session(None, [proxy])
-                    del self._proxies[index]
-                    break
-                raise click.ClickException(
-                    f"Existing attached proxy for {provider_id!r} uses backend={proxy.backend!r}, family={proxy.family!r}; "
-                    f"cannot switch to backend={desired_backend!r}, family={desired_family!r} on the same port."
+            if provider_id == "github-copilot" and provider_id in self._provider_variant_ports:
+                variant_ports = self._provider_variant_ports[provider_id]
+                variant_backends = self._provider_variant_backends.get(provider_id, {})
+                self._ensure_proxy(
+                    provider_id,
+                    port=variant_ports.get("openai", self._provider_ports[provider_id]),
+                    backend=variant_backends.get("openai", "openai"),
+                    family="openai",
+                    variant="openai",
                 )
-            proxy = _start_or_attach_pi_proxy(
+                self._ensure_proxy(
+                    provider_id,
+                    port=variant_ports.get("anthropic", self._provider_ports[provider_id]),
+                    backend=variant_backends.get("anthropic", "anthropic"),
+                    family="anthropic",
+                    variant="anthropic",
+                    model_api="anthropic-messages",
+                    model_id="claude",
+                )
+            else:
+                desired_backend = _resolve_pi_provider_backend(provider_id, self._backend)
+                desired_family = _resolve_pi_provider_family(
+                    provider_id,
+                    backend=desired_backend,
+                )
+                self._ensure_proxy(
+                    provider_id,
+                    port=self._provider_ports[provider_id],
+                    backend=desired_backend,
+                    family=desired_family,
+                )
+
+            provider_payload = _build_pi_session_provider_payload(
                 provider_id,
-                self._provider_ports[provider_id],
-                backend=desired_backend,
-                family=desired_family,
-                memory=self._memory,
-                verbose=self._verbose,
-                model_api=model_api,
-                model_id=model_id,
+                provider_ports=self._provider_ports,
+                provider_variant_ports=self._provider_variant_ports,
+                provider_variant_backends=self._provider_variant_backends,
+                proxies=self._proxies,
             )
-            self._proxies.append(proxy)
-            provider_payload = _build_pi_provider_payload(
-                provider_id,
-                self._provider_ports[provider_id],
-                backend=desired_backend,
-                family=desired_family,
-            )
-            provider_payload["ownership"] = proxy.ownership
             cast(dict[str, Any], self._session_config["providers"])[provider_id] = provider_payload
             self._session_config_path.write_text(
                 json.dumps(self._session_config, indent=2) + "\n",
@@ -5297,6 +5435,7 @@ def _start_or_attach_pi_proxy(
     verbose: bool,
     model_api: str | None = None,
     model_id: str | None = None,
+    variant: str | None = None,
 ) -> _PiManagedProxy:
     """Return proxy ownership state for one managed pi provider."""
 
@@ -5336,6 +5475,7 @@ def _start_or_attach_pi_proxy(
             backend=provider_backend,
             family=provider_family,
             process=None,
+            variant=variant,
         )
 
     bind_error = _port_bind_error(port)
@@ -5373,12 +5513,14 @@ def _start_or_attach_pi_proxy(
         backend=provider_backend,
         family=provider_family,
         process=proc,
+        variant=variant,
     )
 
 
 def _start_pi_managed_proxies(
     managed_providers: Sequence[str],
     provider_ports: Mapping[str, int],
+    provider_variant_ports: Mapping[str, Mapping[str, int]],
     *,
     backend: str | None,
     memory: bool,
@@ -5387,8 +5529,37 @@ def _start_pi_managed_proxies(
     """Start or attach all proxies needed for one wrap-pi session."""
 
     proxies: list[_PiManagedProxy] = []
+    provider_variant_backends = _build_pi_provider_variant_backends(backend)
     try:
         for provider_id in managed_providers:
+            if provider_id == "github-copilot" and provider_id in provider_variant_ports:
+                variant_ports = provider_variant_ports[provider_id]
+                variant_backends = provider_variant_backends.get(provider_id, {})
+                proxies.append(
+                    _start_or_attach_pi_proxy(
+                        provider_id,
+                        variant_ports.get("openai", provider_ports[provider_id]),
+                        backend=variant_backends.get("openai"),
+                        family="openai",
+                        memory=memory,
+                        verbose=verbose,
+                        variant="openai",
+                    )
+                )
+                proxies.append(
+                    _start_or_attach_pi_proxy(
+                        provider_id,
+                        variant_ports.get("anthropic", provider_ports[provider_id]),
+                        backend=variant_backends.get("anthropic"),
+                        family="anthropic",
+                        memory=memory,
+                        verbose=verbose,
+                        model_api="anthropic-messages",
+                        model_id="claude",
+                        variant="anthropic",
+                    )
+                )
+                continue
             proxies.append(
                 _start_or_attach_pi_proxy(
                     provider_id,
@@ -5453,7 +5624,9 @@ def pi(
     pi_binary = _resolve_pi_binary()
     managed_providers = _resolve_pi_managed_providers(providers)
     provider_ports = _resolve_pi_provider_ports(managed_providers, port)
+    provider_variant_ports = _build_pi_provider_variant_ports(managed_providers, provider_ports)
     resolved_backend = _resolve_pi_proxy_backend(backend)
+    provider_variant_backends = _build_pi_provider_variant_backends(resolved_backend)
     proxies: list[_PiManagedProxy] = []
     pi_process: subprocess.Popen[Any] | None = None
     control_server: _PiWrapControlServer | None = None
@@ -5491,6 +5664,7 @@ def pi(
             proxies = _start_pi_managed_proxies(
                 eager_managed_providers,
                 provider_ports,
+                provider_variant_ports,
                 backend=resolved_backend,
                 memory=memory,
                 verbose=verbose,
@@ -5500,13 +5674,17 @@ def pi(
                 managed_providers,
                 provider_ports,
                 auto_manage_current_provider_only=not providers,
+                provider_variant_ports=provider_variant_ports,
+                provider_variant_backends=provider_variant_backends,
             )
-            for proxy in proxies:
-                session_config["providers"][proxy.provider_id]["ownership"] = proxy.ownership
-                session_config["providers"][proxy.provider_id]["backend"] = proxy.backend
-                session_config["providers"][proxy.provider_id]["family"] = proxy.family
-                if proxy.family == "anthropic":
-                    session_config["providers"][proxy.provider_id]["routedBaseUrl"] = session_config["providers"][proxy.provider_id]["rootUrl"]
+            for provider_id in eager_managed_providers:
+                session_config["providers"][provider_id] = _build_pi_session_provider_payload(
+                    provider_id,
+                    provider_ports=provider_ports,
+                    provider_variant_ports=provider_variant_ports,
+                    provider_variant_backends=provider_variant_backends,
+                    proxies=proxies,
+                )
             if not providers:
                 session_config["providers"] = {}
             session_config_path = _write_pi_session_config(temp_dir, session_config)
@@ -5515,6 +5693,8 @@ def pi(
                 session_config=session_config,
                 proxies=proxies,
                 provider_ports=provider_ports,
+                provider_variant_ports=provider_variant_ports,
+                provider_variant_backends=provider_variant_backends,
                 backend=resolved_backend,
                 memory=memory,
                 verbose=verbose,

@@ -147,9 +147,10 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
     wrap_cli, main = wrap_modules
     captured: dict[str, object] = {}
 
-    def fake_start_pi_managed_proxies(managed_providers, provider_ports, **kwargs):
+    def fake_start_pi_managed_proxies(managed_providers, provider_ports, provider_variant_ports, **kwargs):
         captured["managed_providers"] = managed_providers
         captured["provider_ports"] = provider_ports
+        captured["provider_variant_ports"] = provider_variant_ports
         captured["kwargs"] = kwargs
         return []
 
@@ -175,6 +176,9 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
         "anthropic": 8790,
         "github-copilot": 8788,
     }
+    assert captured["provider_variant_ports"] == {
+        "github-copilot": {"openai": 8788, "anthropic": 8791}
+    }
     assert captured["session_config"]["managedProviders"] == [
         "openai",
         "anthropic",
@@ -185,6 +189,58 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
     assert captured["session_config"]["controlUrl"].startswith("http://127.0.0.1:")
 
 
+def test_wrap_pi_explicit_copilot_session_config_includes_dual_family_variants(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, main = wrap_modules
+    captured: dict[str, object] = {}
+
+    def fake_start_pi_managed_proxies(*args, **kwargs):
+        return [
+            wrap_cli._PiManagedProxy(
+                "github-copilot",
+                9911,
+                "attached",
+                "openai",
+                "openai",
+                variant="openai",
+            ),
+            wrap_cli._PiManagedProxy(
+                "github-copilot",
+                9912,
+                "owned",
+                "anthropic",
+                "anthropic",
+                _FakeManagedProcess(),
+                "anthropic",
+            ),
+        ]
+
+    def fake_popen(command: list[str], env: dict[str, str], start_new_session: bool):
+        del command, start_new_session
+        captured["session_config"] = json.loads(
+            Path(env[PI_SESSION_CONFIG_ENV]).read_text(encoding="utf-8")
+        )
+        return _FakePiProcess()
+
+    with (
+        patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies),
+        patch("headroom.cli.wrap.subprocess.Popen", side_effect=fake_popen),
+    ):
+        result = runner.invoke(main, ["wrap", "pi", "--provider", "github-copilot", "--port", "9911"])
+
+    assert result.exit_code == 0, result.output
+    copilot = captured["session_config"]["providers"]["github-copilot"]
+    assert copilot["variants"]["openai"]["port"] == 9911
+    assert copilot["variants"]["openai"]["ownership"] == "attached"
+    assert copilot["variants"]["anthropic"]["port"] == 9912
+    assert copilot["variants"]["anthropic"]["ownership"] == "owned"
+    assert copilot["variants"]["anthropic"]["backend"] == "anthropic"
+    assert copilot["variants"]["anthropic"]["family"] == "anthropic"
+
+
 def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
     runner: CliRunner,
     wrap_modules: tuple[types.ModuleType, click.Group],
@@ -192,11 +248,29 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
     wrap_cli, main = wrap_modules
     captured: dict[str, object] = {}
 
-    def fake_start_pi_managed_proxies(managed_providers, provider_ports, **kwargs):
+    def fake_start_pi_managed_proxies(managed_providers, provider_ports, provider_variant_ports, **kwargs):
         captured["managed_providers"] = managed_providers
         captured["provider_ports"] = provider_ports
+        captured["provider_variant_ports"] = provider_variant_ports
         captured["kwargs"] = kwargs
-        return [wrap_cli._PiManagedProxy("github-copilot", 9911, "attached", "openai", "openai")]
+        return [
+            wrap_cli._PiManagedProxy(
+                "github-copilot",
+                9911,
+                "attached",
+                "openai",
+                "openai",
+                variant="openai",
+            ),
+            wrap_cli._PiManagedProxy(
+                "github-copilot",
+                9912,
+                "attached",
+                "anthropic",
+                "anthropic",
+                variant="anthropic",
+            ),
+        ]
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
@@ -223,6 +297,9 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
     assert result.exit_code == 0, result.output
     assert captured["managed_providers"] == ["github-copilot"]
     assert captured["provider_ports"] == {"github-copilot": 9911}
+    assert captured["provider_variant_ports"] == {
+        "github-copilot": {"openai": 9911, "anthropic": 9912}
+    }
     assert captured["kwargs"] == {"backend": "bedrock", "memory": True, "verbose": False}
 
 
@@ -284,6 +361,17 @@ def test_wrap_pi_help_describes_supported_v1_contract(
     assert "--port" in result.output
     assert "exactly one provider is managed" in result.output
     assert "lazy-manage only the current provider" in result.output
+
+
+def test_build_pi_provider_variant_ports_skips_reserved_primary_ports(
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+
+    assert wrap_cli._build_pi_provider_variant_ports(
+        ["openai", "anthropic", "github-copilot"],
+        {"openai": 8789, "anthropic": 8790, "github-copilot": 8788},
+    ) == {"github-copilot": {"openai": 8788, "anthropic": 8791}}
 
 
 def test_start_or_attach_pi_proxy_accepts_compatible_attach(
@@ -397,6 +485,43 @@ def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     assert all(pid != attached_proc.pid for pid, _signum in calls)
 
 
+def test_start_pi_managed_proxies_starts_copilot_openai_and_anthropic_variants(
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+    calls: list[dict[str, object]] = []
+
+    def fake_start_or_attach(provider_id: str, port: int, **kwargs):
+        calls.append({"provider_id": provider_id, "port": port, **kwargs})
+        return wrap_cli._PiManagedProxy(
+            provider_id,
+            port,
+            "owned",
+            str(kwargs["backend"]),
+            str(kwargs["family"]),
+            variant=kwargs.get("variant"),
+        )
+
+    with patch("headroom.cli.wrap._start_or_attach_pi_proxy", side_effect=fake_start_or_attach):
+        proxies = wrap_cli._start_pi_managed_proxies(
+            ["github-copilot"],
+            {"github-copilot": 8788},
+            {"github-copilot": {"openai": 8788, "anthropic": 8789}},
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+
+    assert [(proxy.port, proxy.variant, proxy.backend, proxy.family) for proxy in proxies] == [
+        (8788, "openai", "openai", "openai"),
+        (8789, "anthropic", "anthropic", "anthropic"),
+    ]
+    assert [(call["port"], call["variant"], call["backend"], call["family"]) for call in calls] == [
+        (8788, "openai", "openai", "openai"),
+        (8789, "anthropic", "anthropic", "anthropic"),
+    ]
+
+
 def test_start_pi_managed_proxies_cleans_up_owned_proxies_after_partial_failure(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
@@ -420,6 +545,7 @@ def test_start_pi_managed_proxies_cleans_up_owned_proxies_after_partial_failure(
             wrap_cli._start_pi_managed_proxies(
                 ["openai", "anthropic"],
                 {"openai": 8789, "anthropic": 8790},
+                {},
                 backend="anthropic",
                 memory=False,
                 verbose=False,

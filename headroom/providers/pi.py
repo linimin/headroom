@@ -32,6 +32,8 @@ PI_EXTENSION_TEMPLATE_ASSET = "pi_extension_template.ts"
 PI_SUPPORTED_PROVIDERS = ("openai", "anthropic", "github-copilot")
 PI_DEFAULT_PROVIDER_ORDER = PI_SUPPORTED_PROVIDERS
 PI_PHASE0_PROBE_TIMEOUT_SECONDS = 60
+PI_COPILOT_DEFAULT_VARIANT = "openai"
+PI_COPILOT_VARIANTS = ("openai", "anthropic")
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,19 @@ def resolve_pi_proxy_backend(backend: str | None) -> str:
     return value
 
 
+def is_pi_copilot_anthropic_model(
+    model_api: str | None,
+    model_id: str | None,
+) -> bool:
+    """Return whether a Copilot model uses the Anthropic Messages wire family."""
+
+    normalized_api = (model_api or "").strip().lower()
+    normalized_model_id = (model_id or "").strip().lower()
+    if normalized_api == "anthropic-messages":
+        return True
+    return normalized_model_id.startswith("claude") or "claude-" in normalized_model_id
+
+
 def resolve_pi_provider_backend(
     provider_id: str,
     backend: str | None,
@@ -147,15 +162,8 @@ def resolve_pi_provider_backend(
     explicit = resolve_pi_proxy_backend(backend)
     if explicit:
         return explicit
-    if provider_id == "github-copilot":
-        family = resolve_pi_provider_family(
-            provider_id,
-            backend=None,
-            model_api=model_api,
-            model_id=model_id,
-        )
-        if family == "anthropic":
-            return "anthropic"
+    if provider_id == "github-copilot" and is_pi_copilot_anthropic_model(model_api, model_id):
+        return "anthropic"
     return managed_provider_specs()[provider_id].default_backend
 
 
@@ -213,14 +221,27 @@ def resolve_pi_provider_family(
         return "anthropic"
     if explicit:
         return spec.family
-    if provider_id == "github-copilot":
-        normalized_api = (model_api or "").strip().lower()
-        normalized_model_id = (model_id or "").strip().lower()
-        if normalized_api == "anthropic-messages":
-            return "anthropic"
-        if normalized_model_id.startswith("claude") or "claude-" in normalized_model_id:
-            return "anthropic"
+    if provider_id == "github-copilot" and is_pi_copilot_anthropic_model(model_api, model_id):
+        return "anthropic"
     return spec.family
+
+
+def _build_pi_route_payload(
+    provider_id: str,
+    port: int,
+    *,
+    backend: str,
+    family: str,
+) -> dict[str, Any]:
+    spec = managed_provider_specs()[provider_id]
+    routed_base_url = spec.root_url(port) if family == "anthropic" else spec.routed_base_url(port)
+    return {
+        "port": port,
+        "rootUrl": spec.root_url(port),
+        "routedBaseUrl": routed_base_url,
+        "family": family,
+        "backend": backend,
+    }
 
 
 def build_pi_provider_payload(
@@ -232,16 +253,54 @@ def build_pi_provider_payload(
 ) -> dict[str, Any]:
     """Build one provider payload entry for `session.json`."""
 
-    spec = managed_provider_specs()[provider_id]
     resolved_family = family or resolve_pi_provider_family(provider_id, backend=backend)
-    routed_base_url = spec.root_url(port) if resolved_family == "anthropic" else spec.routed_base_url(port)
-    return {
-        "port": port,
-        "rootUrl": spec.root_url(port),
-        "routedBaseUrl": routed_base_url,
-        "family": resolved_family,
-        "backend": resolve_pi_provider_backend(provider_id, backend, model_api=None, model_id=None),
+    backend_model_api = None
+    backend_model_id = None
+    if provider_id == "github-copilot" and resolved_family == "anthropic":
+        backend_model_api = "anthropic-messages"
+        backend_model_id = "claude"
+    resolved_backend = resolve_pi_provider_backend(
+        provider_id,
+        backend,
+        model_api=backend_model_api,
+        model_id=backend_model_id,
+    )
+    return _build_pi_route_payload(
+        provider_id,
+        port,
+        backend=resolved_backend,
+        family=resolved_family,
+    )
+
+
+def build_pi_copilot_provider_payload(
+    openai_port: int,
+    anthropic_port: int,
+    *,
+    openai_backend: str | None = None,
+    anthropic_backend: str | None = None,
+) -> dict[str, Any]:
+    """Build the dual-family session payload for GitHub Copilot."""
+
+    openai_payload = build_pi_provider_payload(
+        "github-copilot",
+        openai_port,
+        backend=openai_backend,
+        family="openai",
+    )
+    anthropic_payload = build_pi_provider_payload(
+        "github-copilot",
+        anthropic_port,
+        backend=anthropic_backend,
+        family="anthropic",
+    )
+    payload = dict(openai_payload)
+    payload["defaultVariant"] = PI_COPILOT_DEFAULT_VARIANT
+    payload["variants"] = {
+        "openai": openai_payload,
+        "anthropic": anthropic_payload,
     }
+    return payload
 
 
 def build_pi_wrap_session_config(
@@ -258,12 +317,24 @@ def build_pi_wrap_session_config(
     phase0: Mapping[str, Any] | None = None,
     provider_backends: Mapping[str, str] | None = None,
     provider_families: Mapping[str, str] | None = None,
+    provider_variant_ports: Mapping[str, Mapping[str, int]] | None = None,
+    provider_variant_backends: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical versioned `session.json` payload for `wrap pi`."""
 
     providers: dict[str, Any] = {}
     for provider_id in managed_providers:
         port = provider_ports[provider_id]
+        if provider_id == "github-copilot" and provider_variant_ports and provider_id in provider_variant_ports:
+            variant_ports = provider_variant_ports[provider_id]
+            variant_backends = (provider_variant_backends or {}).get(provider_id, {})
+            providers[provider_id] = build_pi_copilot_provider_payload(
+                openai_port=variant_ports.get("openai", port),
+                anthropic_port=variant_ports.get("anthropic", port),
+                openai_backend=variant_backends.get("openai"),
+                anthropic_backend=variant_backends.get("anthropic"),
+            )
+            continue
         providers[provider_id] = build_pi_provider_payload(
             provider_id,
             port,

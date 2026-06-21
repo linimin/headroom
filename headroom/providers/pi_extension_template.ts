@@ -5,12 +5,18 @@ import type {
 import { githubCopilotOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { promises as fs } from "node:fs";
 
-interface SessionProviderConfig {
+interface SessionProviderRouteConfig {
   port: number;
   rootUrl: string;
   routedBaseUrl: string;
   family: string;
   backend?: string;
+  ownership?: string;
+}
+
+interface SessionProviderConfig extends SessionProviderRouteConfig {
+  defaultVariant?: string;
+  variants?: Record<string, SessionProviderRouteConfig>;
 }
 
 interface SessionHealthConfig {
@@ -113,7 +119,46 @@ export default function (pi: ExtensionAPI) {
 
   const getCurrentModel = (ctx: ExtensionContext): ModelSnapshot | null => getModelSnapshot(ctx.model);
 
-  const dashboardUrl = (managedConfig: SessionProviderConfig): string =>
+  const isCopilotAnthropicModel = (
+    model: { api?: string | null; id?: string | null } | null,
+  ): boolean => {
+    const api = (model?.api ?? "").trim().toLowerCase();
+    const modelId = (model?.id ?? "").trim().toLowerCase();
+    return api === "anthropic-messages" || modelId.startsWith("claude") || modelId.includes("claude-");
+  };
+
+  const desiredVariantKeyForModel = (
+    providerId: string,
+    model: { api?: string | null; id?: string | null } | null,
+  ): string | null => {
+    if (providerId !== "github-copilot") {
+      return null;
+    }
+    return isCopilotAnthropicModel(model) ? "anthropic" : "openai";
+  };
+
+  const resolveProviderTargetConfig = (
+    providerId: string,
+    managedConfig: SessionProviderConfig,
+    model: { api?: string | null; id?: string | null } | null,
+  ): SessionProviderRouteConfig => {
+    const desiredVariant = desiredVariantKeyForModel(providerId, model);
+    if (desiredVariant && managedConfig.variants?.[desiredVariant]) {
+      return managedConfig.variants[desiredVariant];
+    }
+    const defaultVariant = managedConfig.defaultVariant ?? "openai";
+    if (managedConfig.variants?.[defaultVariant]) {
+      return managedConfig.variants[defaultVariant];
+    }
+    return managedConfig;
+  };
+
+  const providerStateKey = (
+    providerId: string,
+    managedConfig: SessionProviderRouteConfig,
+  ): string => `${providerId}:${managedConfig.rootUrl}`;
+
+  const dashboardUrl = (managedConfig: SessionProviderRouteConfig): string =>
     `${managedConfig.rootUrl}/dashboard`;
 
   const loadConfig = async (): Promise<SessionConfig> => {
@@ -166,8 +211,8 @@ export default function (pi: ExtensionAPI) {
     return { providerId: null, source: "unresolved" };
   };
 
-  const getHealthState = (providerId: string): ProviderHealthState => {
-    const existing = providerHealth.get(providerId);
+  const getHealthState = (stateKey: string): ProviderHealthState => {
+    const existing = providerHealth.get(stateKey);
     if (existing) {
       return existing;
     }
@@ -180,7 +225,7 @@ export default function (pi: ExtensionAPI) {
       hasEverAttached: false,
       lastFailure: null,
     };
-    providerHealth.set(providerId, initialState);
+    providerHealth.set(stateKey, initialState);
     return initialState;
   };
 
@@ -204,10 +249,11 @@ export default function (pi: ExtensionAPI) {
   const refreshProviderHealth = async (
     config: SessionConfig,
     providerId: string,
+    managedConfig: SessionProviderRouteConfig,
     reason: string,
   ): Promise<ProviderHealthState> => {
-    const managedConfig = config.providers[providerId];
-    const state = getHealthState(providerId);
+    const stateKey = providerStateKey(providerId, managedConfig);
+    const state = getHealthState(stateKey);
     const now = Date.now();
     if (state.nextProbeAt > now) {
       return state;
@@ -244,12 +290,13 @@ export default function (pi: ExtensionAPI) {
 
     state.lastCheckedAt = now;
     state.nextProbeAt = now + ttlMs;
-    providerHealth.set(providerId, state);
+    providerHealth.set(stateKey, state);
 
     await logEvent(config, "provider_health_checked", {
       providerId,
       reason,
       rootUrl: managedConfig.rootUrl,
+      variantFamily: managedConfig.family,
       ok: probeResult.ok,
       detail: probeResult.detail,
       status: state.status,
@@ -264,6 +311,7 @@ export default function (pi: ExtensionAPI) {
         providerId,
         reason,
         previousStatus,
+        rootUrl: managedConfig.rootUrl,
         status: state.status,
         detail: probeResult.detail,
         consecutiveFailures: state.consecutiveFailures,
@@ -421,22 +469,18 @@ export default function (pi: ExtensionAPI) {
     providerId: string,
     currentModel: ModelSnapshot | null,
   ): Promise<SessionConfig> => {
-    const desiredBackend = providerId === "github-copilot" && currentModel?.api === "anthropic-messages"
-      ? "anthropic"
-      : providerId === "github-copilot" && (currentModel?.id.toLowerCase().startsWith("claude") || currentModel?.id.toLowerCase().includes("claude-"))
-        ? "anthropic"
-        : providerId === "github-copilot"
-          ? "openai"
-          : null;
-    const desiredFamily = desiredBackend === "anthropic" ? "anthropic" : null;
     const existing = config.providers[providerId];
     const needsMaterialize = config.autoManageCurrentProviderOnly && !existing;
-    const needsReconcile =
+    const desiredVariant = desiredVariantKeyForModel(providerId, currentModel);
+    const needsCopilotVariantHydration =
       providerId === "github-copilot" &&
       !!existing &&
-      !!desiredBackend &&
-      (existing.backend !== desiredBackend || (desiredFamily && existing.family !== desiredFamily));
-    if ((!needsMaterialize && !needsReconcile) || !config.controlUrl) {
+      (
+        !existing.variants?.openai ||
+        !existing.variants?.anthropic ||
+        (!!desiredVariant && !existing.variants?.[desiredVariant])
+      );
+    if ((!needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
       return config;
     }
     try {
@@ -460,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 
   const refreshPerfSummary = async (
     providerId: string,
-    managedConfig: SessionProviderConfig,
+    managedConfig: SessionProviderRouteConfig,
   ): Promise<void> => {
     const urls = [
       `${managedConfig.rootUrl}/stats?cached=1`,
@@ -475,7 +519,7 @@ export default function (pi: ExtensionAPI) {
         const payload = (await response.json()) as unknown;
         const summary = parsePerfSummary(payload);
         if (!summary) continue;
-        providerPerf.set(providerId, summary);
+        providerPerf.set(providerStateKey(providerId, managedConfig), summary);
         return;
       } catch {
         // Footer metrics are best-effort only.
@@ -496,12 +540,14 @@ export default function (pi: ExtensionAPI) {
   ): string => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
-    if (!providerId || !config.providers[providerId]) {
+    const managedConfig = providerId ? config.providers[providerId] : undefined;
+    if (!providerId || !managedConfig) {
       return "Headroom:off";
     }
 
+    const targetConfig = resolveProviderTargetConfig(providerId, managedConfig, currentModel);
     const label = shortProviderLabel(providerId);
-    const perf = providerPerf.get(providerId);
+    const perf = providerPerf.get(providerStateKey(providerId, targetConfig));
     const usdSuffix =
       typeof perf?.savingsUsd === "number"
         ? ` | ${formatCompactUsd(perf.savingsUsd)}`
@@ -513,7 +559,7 @@ export default function (pi: ExtensionAPI) {
     if (registeredProviders.has(providerId)) {
       return `Headroom:${label} ↑${perfSuffix}`;
     }
-    const healthState = providerHealth.get(providerId);
+    const healthState = providerHealth.get(providerStateKey(providerId, targetConfig));
     if (healthState?.status === "unavailable") {
       return `Headroom:${label} down${perfSuffix}`;
     }
@@ -561,20 +607,30 @@ export default function (pi: ExtensionAPI) {
     }
 
     const managedConfig = config.providers[providerId];
-    const perf = providerPerf.get(providerId);
-    const healthState = providerHealth.get(providerId);
+    const targetConfig = resolveProviderTargetConfig(providerId, managedConfig, currentModel);
+    const variantKey = desiredVariantKeyForModel(providerId, currentModel);
+    const perf = providerPerf.get(providerStateKey(providerId, targetConfig));
+    const healthState = providerHealth.get(providerStateKey(providerId, targetConfig));
     const attached = registeredProviders.has(providerId);
-    return [
+    const lines = [
       `Provider: ${providerId}`,
       `Status: ${attached ? "running" : healthState?.status ?? "idle"}`,
-      `Routed base URL: ${managedConfig.routedBaseUrl}`,
-      `Proxy root URL: ${managedConfig.rootUrl}`,
-      `Dashboard: ${dashboardUrl(managedConfig)}`,
+    ];
+    if (providerId === "github-copilot") {
+      lines.push(`Variant: ${variantKey ?? managedConfig.defaultVariant ?? "openai"}`);
+    }
+    lines.push(
+      `Backend: ${targetConfig.backend ?? "(unknown)"}`,
+      `Family: ${targetConfig.family}`,
+      `Routed base URL: ${targetConfig.routedBaseUrl}`,
+      `Proxy root URL: ${targetConfig.rootUrl}`,
+      `Dashboard: ${dashboardUrl(targetConfig)}`,
       `Lifetime tokens saved: ${perf ? formatCompactMetric(perf.tokensSaved) : "(unavailable)"}`,
       `Lifetime compression savings: ${typeof perf?.savingsUsd === "number" ? formatCompactUsd(perf.savingsUsd) : "(unavailable)"}`,
       `Savings percent: ${perf ? formatSavingsPercent(perf.savingsPercent) : "(unavailable)"}`,
       `Footer: ${activeStatusLine(config, currentModel)}`,
-    ];
+    );
+    return lines;
   };
 
   const registerCommands = (piApi: ExtensionAPI): void => {
@@ -586,11 +642,12 @@ export default function (pi: ExtensionAPI) {
         const currentModel = getCurrentModel(ctx);
         const resolution = getResolution(currentModel);
         const providerId = resolution.providerId;
-        if (providerId && config.providers[providerId]) {
-          await syncCurrentProvider(config, currentModel, "headroom_status_command");
-        }
-        updateUiStatus(config, ctx, currentModel);
-        notifyUi(ctx, statusLines(config, currentModel).join("\n"), "info");
+        const effectiveConfig =
+          providerId && config.managedProviders.includes(providerId)
+            ? await syncCurrentProvider(config, currentModel, "headroom_status_command")
+            : config;
+        updateUiStatus(effectiveConfig, ctx, currentModel);
+        notifyUi(ctx, statusLines(effectiveConfig, currentModel).join("\n"), "info");
       },
     });
   };
@@ -599,17 +656,7 @@ export default function (pi: ExtensionAPI) {
     providerId: string,
     managedConfig: SessionProviderConfig,
     model: { api?: string | null; id?: string | null } | null,
-  ): string => {
-    if (providerId !== "github-copilot") {
-      return managedConfig.routedBaseUrl;
-    }
-    const api = (model?.api ?? "").trim().toLowerCase();
-    const modelId = (model?.id ?? "").trim().toLowerCase();
-    if (api === "anthropic-messages" || modelId.startsWith("claude") || modelId.includes("claude-")) {
-      return managedConfig.rootUrl;
-    }
-    return managedConfig.routedBaseUrl;
-  };
+  ): string => resolveProviderTargetConfig(providerId, managedConfig, model).routedBaseUrl;
 
   const registerProvider = async (
     config: SessionConfig,
@@ -669,6 +716,7 @@ export default function (pi: ExtensionAPI) {
       currentModel,
       resolutionSource,
       healthStatus: healthState.status,
+      variantKey: desiredVariantKeyForModel(providerId, currentModel),
     });
   };
 
@@ -676,7 +724,7 @@ export default function (pi: ExtensionAPI) {
     config: SessionConfig,
     currentModel: ModelSnapshot | null,
     reason: string,
-  ): Promise<void> => {
+  ): Promise<SessionConfig> => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
 
@@ -689,7 +737,7 @@ export default function (pi: ExtensionAPI) {
 
     if (!providerId) {
       await unregisterOtherProviders(config, null, `${reason}:unresolved-provider`);
-      return;
+      return config;
     }
 
     await unregisterOtherProviders(config, providerId, `${reason}:switched-provider`);
@@ -702,22 +750,23 @@ export default function (pi: ExtensionAPI) {
     const managedConfig = workingConfig.providers[providerId];
     if (!managedConfig) {
       await unregisterProvider(config, providerId, `${reason}:unmanaged-provider`);
-      return;
+      return workingConfig;
     }
 
     if (workingConfig.phase0?.forceNativeProviders?.includes(providerId)) {
       await unregisterProvider(workingConfig, providerId, `${reason}:forced-native`);
-      return;
+      return workingConfig;
     }
 
-    const healthState = await refreshProviderHealth(workingConfig, providerId, reason);
+    const targetConfig = resolveProviderTargetConfig(providerId, managedConfig, currentModel);
+    const healthState = await refreshProviderHealth(workingConfig, providerId, targetConfig, reason);
     const shouldAttach =
       healthState.status === "healthy" ||
       (healthState.status === "suspect" && (healthState.hasEverAttached || registeredProviders.has(providerId)));
 
     if (!shouldAttach) {
       await unregisterProvider(workingConfig, providerId, `${reason}:proxy-${healthState.status}`);
-      return;
+      return workingConfig;
     }
 
     await registerProvider(
@@ -729,7 +778,8 @@ export default function (pi: ExtensionAPI) {
       resolution.source,
       healthState,
     );
-    await refreshPerfSummary(providerId, managedConfig);
+    await refreshPerfSummary(providerId, targetConfig);
+    return workingConfig;
   };
 
   registerCommands(pi);
@@ -742,8 +792,8 @@ export default function (pi: ExtensionAPI) {
       currentModel,
       sessionConfigPath: process.env.HEADROOM_PI_SESSION_CONFIG,
     });
-    await syncCurrentProvider(config, currentModel, "session_start");
-    updateUiStatus(config, ctx, currentModel);
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "session_start");
+    updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
   pi.on("model_select", async (event, ctx) => {
@@ -754,15 +804,15 @@ export default function (pi: ExtensionAPI) {
       currentModel,
       previousModel: getModelSnapshot(event.previousModel),
     });
-    await syncCurrentProvider(config, currentModel, "model_select");
-    updateUiStatus(config, ctx, currentModel);
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "model_select");
+    updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const config = await loadConfig();
     const currentModel = getCurrentModel(ctx);
-    await syncCurrentProvider(config, currentModel, "before_agent_start");
-    updateUiStatus(config, ctx, currentModel);
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "before_agent_start");
+    updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
