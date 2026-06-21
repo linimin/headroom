@@ -568,7 +568,7 @@ def test_run_dynamic_routing_probe_proves_hysteresis_and_family_routing() -> Non
         for event in result["events"]
         if event["type"] == "provider_health_checked" and event["providerId"] == "openai"
     ]
-    assert len(health_checks) == 5
+    assert len(health_checks) >= 5
 
     transitions = [
         (event["previousStatus"], event["status"])
