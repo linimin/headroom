@@ -5325,7 +5325,7 @@ class _PiWrapControlServer:
                 f"cannot switch to backend={backend!r}, family={family!r} on the same port."
             )
 
-        deadline = time.monotonic() + 3.0 if replaced_stale_proxy else time.monotonic()
+        deadline = time.monotonic() + 5.0 if replaced_stale_proxy else time.monotonic()
         while True:
             try:
                 proxy = _start_or_attach_pi_proxy(
