@@ -352,6 +352,20 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const clearProviderRuntimeState = (providerId: string): void => {
+    const prefix = `${providerId}:`;
+    for (const key of Array.from(providerHealth.keys())) {
+      if (key.startsWith(prefix)) {
+        providerHealth.delete(key);
+      }
+    }
+    for (const key of Array.from(providerPerf.keys())) {
+      if (key.startsWith(prefix)) {
+        providerPerf.delete(key);
+      }
+    }
+  };
+
   const numberOrZero = (value: unknown): number =>
     typeof value === "number" && Number.isFinite(value) ? value : 0;
 
@@ -728,6 +742,69 @@ export default function (pi: ExtensionAPI) {
     return state;
   };
 
+  const markOwnedRouteHealthy = (
+    config: SessionConfig,
+    managedConfig: SessionProviderRouteConfig,
+    state: ProviderHealthState,
+  ): ProviderHealthState => {
+    if (managedConfig.ownership !== "owned" || state.status === "healthy") {
+      return state;
+    }
+    state.status = "healthy";
+    state.lastFailure = null;
+    state.consecutiveFailures = 0;
+    state.consecutiveSuccesses = Math.max(
+      state.consecutiveSuccesses,
+      Math.max(1, config.health.reattachSuccesses ?? 1),
+    );
+    return state;
+  };
+
+  const fullResyncProvider = async (
+    config: SessionConfig,
+    providerId: string,
+    currentModel: ModelSnapshot | null,
+    reason: string,
+  ): Promise<{
+    config: SessionConfig;
+    managedConfig: SessionProviderConfig;
+    targetConfig: SessionProviderRouteConfig;
+    healthState: ProviderHealthState;
+  } | null> => {
+    clearProviderRuntimeState(providerId);
+    let reloadedConfig = await loadConfig();
+    if (reloadedConfig.managedProviders.includes(providerId)) {
+      reloadedConfig = await ensureManagedProvider(reloadedConfig, providerId, currentModel, {
+        force: true,
+      });
+    }
+    const reloadedManagedConfig = reloadedConfig.providers[providerId];
+    if (!reloadedManagedConfig) {
+      return null;
+    }
+    const reloadedTargetConfig = resolveProviderTargetConfig(
+      providerId,
+      reloadedManagedConfig,
+      currentModel,
+    );
+    const reloadedHealthState = markOwnedRouteHealthy(
+      reloadedConfig,
+      reloadedTargetConfig,
+      await waitForRecoveredHealth(
+        reloadedConfig,
+        providerId,
+        reloadedTargetConfig,
+        `${reason}:full_resync`,
+      ),
+    );
+    return {
+      config: reloadedConfig,
+      managedConfig: reloadedManagedConfig,
+      targetConfig: reloadedTargetConfig,
+      healthState: reloadedHealthState,
+    };
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -874,20 +951,29 @@ export default function (pi: ExtensionAPI) {
         const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned";
         const routeChanged =
           previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership;
-        healthState = await waitForRecoveredHealth(
+        healthState = markOwnedRouteHealthy(
           workingConfig,
-          providerId,
           targetConfig,
-          `${reason}:self_heal`,
+          await waitForRecoveredHealth(
+            workingConfig,
+            providerId,
+            targetConfig,
+            `${reason}:self_heal`,
+          ),
         );
-        if (tookOver && healthState.status !== "healthy") {
-          healthState.status = "healthy";
-          healthState.lastFailure = null;
-          healthState.consecutiveFailures = 0;
-          healthState.consecutiveSuccesses = Math.max(
-            healthState.consecutiveSuccesses,
-            Math.max(1, workingConfig.health.reattachSuccesses ?? 1),
+        if (routeChanged || tookOver) {
+          const resynced = await fullResyncProvider(
+            workingConfig,
+            providerId,
+            currentModel,
+            `${reason}:post_self_heal`,
           );
+          if (resynced) {
+            workingConfig = resynced.config;
+            managedConfig = resynced.managedConfig;
+            targetConfig = resynced.targetConfig;
+            healthState = resynced.healthState;
+          }
         }
         await logEvent(workingConfig, "provider_self_heal_result", {
           providerId,
@@ -976,7 +1062,21 @@ export default function (pi: ExtensionAPI) {
     await logEvent(config, "agent_end", {
       currentModel,
     });
-    const effectiveConfig = await syncCurrentProvider(config, currentModel, "agent_end", ctx);
+    let effectiveConfig = await syncCurrentProvider(config, currentModel, "agent_end", ctx);
+    const resolution = getResolution(currentModel);
+    const providerId = resolution.providerId;
+    if (
+      providerId &&
+      effectiveConfig.managedProviders.includes(providerId) &&
+      !registeredProviders.has(providerId)
+    ) {
+      effectiveConfig = await syncCurrentProvider(
+        effectiveConfig,
+        currentModel,
+        "agent_end_resync",
+        ctx,
+      );
+    }
     updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 }

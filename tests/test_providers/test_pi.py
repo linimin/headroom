@@ -162,9 +162,11 @@ def test_load_pi_extension_template_reads_packaged_asset() -> None:
     assert "notifyUiSoon" in packaged_template
     assert "yieldToUi" in packaged_template
     assert "waitForRecoveredHealth" in packaged_template
+    assert "fullResyncProvider" in packaged_template
     assert "maxEnsureAttempts = force ? 8 : 1" in packaged_template
     assert 'managedConfig.ownership === "owned"' in packaged_template
     assert 'syncCurrentProvider(config, currentModel, "agent_end", ctx)' in packaged_template
+    assert '"agent_end_resync"' in packaged_template
     assert (
         'const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned"'
         in packaged_template
