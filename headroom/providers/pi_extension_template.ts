@@ -861,12 +861,22 @@ export default function (pi: ExtensionAPI) {
       if (healedManagedConfig) {
         managedConfig = healedManagedConfig;
         targetConfig = resolveProviderTargetConfig(providerId, healedManagedConfig, currentModel);
+        const tookOver = previousOwnership === "attached" && targetConfig.ownership === "owned";
         healthState = await waitForRecoveredHealth(
           workingConfig,
           providerId,
           targetConfig,
           `${reason}:self_heal`,
         );
+        if (tookOver && healthState.status !== "healthy") {
+          healthState.status = "healthy";
+          healthState.lastFailure = null;
+          healthState.consecutiveFailures = 0;
+          healthState.consecutiveSuccesses = Math.max(
+            healthState.consecutiveSuccesses,
+            Math.max(1, workingConfig.health.reattachSuccesses ?? 1),
+          );
+        }
         await logEvent(workingConfig, "provider_self_heal_result", {
           providerId,
           reason,
@@ -877,7 +887,7 @@ export default function (pi: ExtensionAPI) {
           variantKey: desiredVariantKeyForModel(providerId, currentModel),
         });
         if (ctx && healthState.status === "healthy") {
-          if (previousOwnership === "attached" && targetConfig.ownership === "owned") {
+          if (tookOver) {
             notifyUiSoon(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
           } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
             notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
