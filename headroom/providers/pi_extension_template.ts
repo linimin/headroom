@@ -976,6 +976,7 @@ export default function (pi: ExtensionAPI) {
     await logEvent(config, "agent_end", {
       currentModel,
     });
-    updateUiStatus(config, ctx, currentModel);
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "agent_end", ctx);
+    updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 }
