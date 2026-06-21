@@ -647,7 +647,7 @@ export default function (pi: ExtensionAPI) {
         const providerId = resolution.providerId;
         const effectiveConfig =
           providerId && config.managedProviders.includes(providerId)
-            ? await syncCurrentProvider(config, currentModel, "headroom_status_command")
+            ? await syncCurrentProvider(config, currentModel, "headroom_status_command", ctx)
             : config;
         updateUiStatus(effectiveConfig, ctx, currentModel);
         notifyUi(ctx, statusLines(effectiveConfig, currentModel).join("\n"), "info");
@@ -660,6 +660,18 @@ export default function (pi: ExtensionAPI) {
     managedConfig: SessionProviderConfig,
     model: { api?: string | null; id?: string | null } | null,
   ): string => resolveProviderTargetConfig(providerId, managedConfig, model).routedBaseUrl;
+
+  const selfHealLabel = (
+    providerId: string,
+    targetConfig: SessionProviderRouteConfig,
+    currentModel: ModelSnapshot | null,
+  ): string => {
+    if (providerId !== "github-copilot") {
+      return providerId;
+    }
+    const variantKey = desiredVariantKeyForModel(providerId, currentModel) ?? targetConfig.family;
+    return `${providerId} (${variantKey})`;
+  };
 
   const registerProvider = async (
     config: SessionConfig,
@@ -727,6 +739,7 @@ export default function (pi: ExtensionAPI) {
     config: SessionConfig,
     currentModel: ModelSnapshot | null,
     reason: string,
+    ctx?: ExtensionContext,
   ): Promise<SessionConfig> => {
     const resolution = getResolution(currentModel);
     const providerId = resolution.providerId;
@@ -779,12 +792,14 @@ export default function (pi: ExtensionAPI) {
         (reason === "before_agent_start" && healthState.status !== "healthy")
       );
     if (shouldAttemptSelfHeal) {
+      const previousOwnership = targetConfig.ownership ?? null;
+      const previousRootUrl = targetConfig.rootUrl;
       await logEvent(workingConfig, "provider_self_heal_attempt", {
         providerId,
         reason,
         currentModel,
-        previousOwnership: targetConfig.ownership ?? null,
-        previousRootUrl: targetConfig.rootUrl,
+        previousOwnership,
+        previousRootUrl,
         previousStatus: healthState.status,
         variantKey: desiredVariantKeyForModel(providerId, currentModel),
       });
@@ -811,6 +826,14 @@ export default function (pi: ExtensionAPI) {
           status: healthState.status,
           variantKey: desiredVariantKeyForModel(providerId, currentModel),
         });
+        if (ctx && healthState.status === "healthy") {
+          const label = selfHealLabel(providerId, targetConfig, currentModel);
+          if (previousOwnership === "attached" && targetConfig.ownership === "owned") {
+            notifyUi(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
+          } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
+            notifyUi(ctx, `Headroom reattached ${label}.`, "info");
+          }
+        }
       }
     }
 
@@ -846,7 +869,7 @@ export default function (pi: ExtensionAPI) {
       currentModel,
       sessionConfigPath: process.env.HEADROOM_PI_SESSION_CONFIG,
     });
-    const effectiveConfig = await syncCurrentProvider(config, currentModel, "session_start");
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "session_start", ctx);
     updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
@@ -858,14 +881,14 @@ export default function (pi: ExtensionAPI) {
       currentModel,
       previousModel: getModelSnapshot(event.previousModel),
     });
-    const effectiveConfig = await syncCurrentProvider(config, currentModel, "model_select");
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "model_select", ctx);
     updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const config = await loadConfig();
     const currentModel = getCurrentModel(ctx);
-    const effectiveConfig = await syncCurrentProvider(config, currentModel, "before_agent_start");
+    const effectiveConfig = await syncCurrentProvider(config, currentModel, "before_agent_start", ctx);
     updateUiStatus(effectiveConfig, ctx, currentModel);
   });
 
