@@ -403,6 +403,15 @@ def _get_proxy_stdio_log_path() -> Path:
     return _get_log_path().with_name("proxy-stdio.log")
 
 
+def _read_proxy_log_tail(log_path: Path, max_chars: int = 1000) -> str:
+    """Return a small trailing slice of the proxy log for startup errors."""
+
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace")[-max_chars:]
+    except Exception:
+        return "(no log output)"
+
+
 def _start_proxy(
     port: int,
     *,
@@ -514,18 +523,16 @@ def _start_proxy(
         # Check if process died
         if proc.poll() is not None:
             stdio_log_file.close()
-            # Read last few lines of log for error context
-            try:
-                tail = _read_text(stdio_log_path)[-500:]
-            except Exception:
-                tail = "(no log output)"
-            raise RuntimeError(f"Proxy exited with code {proc.returncode}: {tail}")
+            raise RuntimeError(
+                f"Proxy exited with code {proc.returncode}: {_read_proxy_log_tail(stdio_log_path)}"
+            )
 
     proc.kill()
     stdio_log_file.close()
     raise RuntimeError(
         f"Proxy failed to start on port {port} within {timeout_seconds} seconds. "
-        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup."
+        f"Set {_WRAP_PROXY_TIMEOUT_ENV} to a larger number of seconds for slow startup. "
+        f"Recent proxy log tail:\n{_read_proxy_log_tail(log_path)}"
     )
 
 
