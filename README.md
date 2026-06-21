@@ -260,7 +260,7 @@ Supported v1 provider scope is exactly:
 
 Parity rules for the current release:
 
-- `--provider` is repeatable; omit it to lazy-manage the three supported providers on demand.
+- `--provider` is repeatable; omit it to lazy-manage the three supported providers on demand. In this fail-open lazy mode, the first request can continue on pi's native provider while Headroom starts the proxy in the background; subsequent requests attach automatically once the proxy is ready.
 - `--port` is valid only when exactly one provider is managed. Multi-provider runs use canonical default ports.
 - `github-copilot` preserves pi's native OAuth flow and routes both OpenAI-wire and Anthropic-wire models through separate managed local variants. Anthropic-wire Copilot models use a companion local port automatically and start on demand instead of adding a second eager startup cost to every session.
 - If a compatible Headroom proxy is already running on the needed port, `headroom wrap pi` attaches instead of restarting it. Incompatible proxies are rejected before launch.
