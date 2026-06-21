@@ -251,11 +251,12 @@ export default function (pi: ExtensionAPI) {
     providerId: string,
     managedConfig: SessionProviderRouteConfig,
     reason: string,
+    force = false,
   ): Promise<ProviderHealthState> => {
     const stateKey = providerStateKey(providerId, managedConfig);
     const state = getHealthState(stateKey);
     const now = Date.now();
-    if (state.nextProbeAt > now) {
+    if (!force && state.nextProbeAt > now) {
       return state;
     }
 
@@ -468,6 +469,7 @@ export default function (pi: ExtensionAPI) {
     config: SessionConfig,
     providerId: string,
     currentModel: ModelSnapshot | null,
+    options?: { force?: boolean },
   ): Promise<SessionConfig> => {
     const existing = config.providers[providerId];
     const needsMaterialize = config.autoManageCurrentProviderOnly && !existing;
@@ -480,7 +482,8 @@ export default function (pi: ExtensionAPI) {
         !existing.variants?.anthropic ||
         (!!desiredVariant && !existing.variants?.[desiredVariant])
       );
-    if ((!needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
+    const force = options?.force === true;
+    if ((!force && !needsMaterialize && !needsCopilotVariantHydration) || !config.controlUrl) {
       return config;
     }
     try {
@@ -747,7 +750,7 @@ export default function (pi: ExtensionAPI) {
       workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel);
     }
 
-    const managedConfig = workingConfig.providers[providerId];
+    let managedConfig = workingConfig.providers[providerId];
     if (!managedConfig) {
       await unregisterProvider(config, providerId, `${reason}:unmanaged-provider`);
       return workingConfig;
@@ -758,8 +761,59 @@ export default function (pi: ExtensionAPI) {
       return workingConfig;
     }
 
-    const targetConfig = resolveProviderTargetConfig(providerId, managedConfig, currentModel);
-    const healthState = await refreshProviderHealth(workingConfig, providerId, targetConfig, reason);
+    let targetConfig = resolveProviderTargetConfig(providerId, managedConfig, currentModel);
+    const forceHealthProbe = reason === "before_agent_start" && targetConfig.ownership === "attached";
+    let healthState = await refreshProviderHealth(
+      workingConfig,
+      providerId,
+      targetConfig,
+      reason,
+      forceHealthProbe,
+    );
+
+    const shouldAttemptSelfHeal =
+      targetConfig.ownership === "attached" &&
+      workingConfig.managedProviders.includes(providerId) &&
+      (
+        healthState.status === "unavailable" ||
+        (reason === "before_agent_start" && healthState.status !== "healthy")
+      );
+    if (shouldAttemptSelfHeal) {
+      await logEvent(workingConfig, "provider_self_heal_attempt", {
+        providerId,
+        reason,
+        currentModel,
+        previousOwnership: targetConfig.ownership ?? null,
+        previousRootUrl: targetConfig.rootUrl,
+        previousStatus: healthState.status,
+        variantKey: desiredVariantKeyForModel(providerId, currentModel),
+      });
+      workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel, {
+        force: true,
+      });
+      const healedManagedConfig = workingConfig.providers[providerId];
+      if (healedManagedConfig) {
+        managedConfig = healedManagedConfig;
+        targetConfig = resolveProviderTargetConfig(providerId, healedManagedConfig, currentModel);
+        healthState = await refreshProviderHealth(
+          workingConfig,
+          providerId,
+          targetConfig,
+          `${reason}:self_heal`,
+          true,
+        );
+        await logEvent(workingConfig, "provider_self_heal_result", {
+          providerId,
+          reason,
+          currentModel,
+          ownership: targetConfig.ownership ?? null,
+          rootUrl: targetConfig.rootUrl,
+          status: healthState.status,
+          variantKey: desiredVariantKeyForModel(providerId, currentModel),
+        });
+      }
+    }
+
     const shouldAttach =
       healthState.status === "healthy" ||
       (healthState.status === "suspect" && (healthState.hasEverAttached || registeredProviders.has(providerId)));
