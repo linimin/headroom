@@ -139,6 +139,7 @@ from headroom.providers.pi import probe_attach_compatibility as _probe_pi_attach
 from headroom.providers.pi import render_pi_extension as _render_pi_extension
 from headroom.providers.pi import resolve_managed_providers as _resolve_pi_managed_providers
 from headroom.providers.pi import resolve_pi_binary as _resolve_pi_binary
+from headroom.providers.pi import resolve_pi_provider_backend as _resolve_pi_provider_backend
 from headroom.providers.pi import resolve_pi_proxy_backend as _resolve_pi_proxy_backend
 from headroom.providers.pi import resolve_provider_ports as _resolve_pi_provider_ports
 from headroom.providers.pi import write_pi_session_config as _write_pi_session_config
@@ -5157,10 +5158,11 @@ def _start_or_attach_pi_proxy(
 ) -> _PiManagedProxy:
     """Return proxy ownership state for one managed pi provider."""
 
+    provider_backend = _resolve_pi_provider_backend(provider_id, backend)
     attach_probe = _probe_pi_attach_compatibility(
         provider_id,
         port,
-        backend=backend,
+        backend=provider_backend,
         memory=memory,
     )
     if attach_probe.status == "compatible":
@@ -5198,12 +5200,12 @@ def _start_or_attach_pi_proxy(
             port,
             memory=memory,
             agent_type="pi",
-            backend=backend,
+            backend=provider_backend,
             extra_env=_build_pi_proxy_metadata_env(provider_id),
         ),
     )
     if verbose:
-        click.echo(f"   ownership=owned backend={backend}")
+        click.echo(f"   ownership=owned backend={provider_backend}")
     return _PiManagedProxy(
         provider_id=provider_id,
         port=port,

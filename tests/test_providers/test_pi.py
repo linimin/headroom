@@ -74,6 +74,16 @@ def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: 
     assert loud_env[pi_mod.PI_VERBOSE_ENV] == "1"
 
 
+def test_resolve_pi_provider_backend_uses_provider_specific_defaults() -> None:
+    assert pi_mod.resolve_pi_provider_backend("openai", None) == "openai"
+    assert pi_mod.resolve_pi_provider_backend("anthropic", None) == "anthropic"
+    assert pi_mod.resolve_pi_provider_backend("github-copilot", None) == "openai"
+
+
+def test_resolve_pi_provider_backend_respects_explicit_override() -> None:
+    assert pi_mod.resolve_pi_provider_backend("github-copilot", "bedrock") == "bedrock"
+
+
 def test_load_pi_extension_template_reads_packaged_asset() -> None:
     packaged_template = (
         importlib_resources.files("headroom.providers")
@@ -250,8 +260,19 @@ def test_build_pi_launch_args_rejects_user_extension_flags(
         pi_mod.build_pi_launch_args(pi_args, tmp_path / "extension.ts")
 
 
-def test_build_pi_proxy_metadata_env_uses_provider_family() -> None:
+def test_build_pi_proxy_metadata_env_uses_provider_family_and_copilot_upstream() -> None:
     env = pi_mod.build_pi_proxy_metadata_env("github-copilot")
+    assert env == {
+        pi_mod.PI_PROXY_METADATA_FAMILY_ENV: "openai",
+        pi_mod.PI_PROXY_METADATA_CAPABILITY_ENV: "1",
+        pi_mod.PI_OPENAI_TARGET_API_URL_ENV: "https://api.githubcopilot.com",
+        pi_mod.PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
+        pi_mod.PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
+    }
+
+
+def test_build_pi_proxy_metadata_env_for_openai_has_only_generic_metadata() -> None:
+    env = pi_mod.build_pi_proxy_metadata_env("openai")
     assert env == {
         pi_mod.PI_PROXY_METADATA_FAMILY_ENV: "openai",
         pi_mod.PI_PROXY_METADATA_CAPABILITY_ENV: "1",
@@ -284,7 +305,7 @@ def _urlopen_with_payload(payload: dict[str, object]):
 def test_probe_attach_compatibility_accepts_matching_metadata() -> None:
     payload = {
         "headroomVersion": __version__,
-        "backend": "anthropic",
+        "backend": "openai",
         "upstreamFamily": "openai",
         "memory": False,
         "capabilities": {"attachCompatible": True, "wrapPi": True},
@@ -292,7 +313,7 @@ def test_probe_attach_compatibility_accepts_matching_metadata() -> None:
     result = pi_mod.probe_attach_compatibility(
         "github-copilot",
         8788,
-        backend="anthropic",
+        backend=None,
         memory=False,
         urlopen=_urlopen_with_payload(payload),
     )
@@ -312,7 +333,7 @@ def test_probe_attach_compatibility_rejects_backend_mismatch() -> None:
     result = pi_mod.probe_attach_compatibility(
         "openai",
         8789,
-        backend="anthropic",
+        backend=None,
         memory=False,
         urlopen=_urlopen_with_payload(payload),
     )
@@ -323,14 +344,14 @@ def test_probe_attach_compatibility_rejects_backend_mismatch() -> None:
 def test_probe_attach_compatibility_rejects_missing_required_metadata_fields() -> None:
     payload = {
         "headroomVersion": __version__,
-        "backend": "anthropic",
+        "backend": "openai",
         "memory": False,
         "capabilities": {"attachCompatible": True, "wrapPi": True},
     }
     result = pi_mod.probe_attach_compatibility(
         "openai",
         8789,
-        backend="anthropic",
+        backend=None,
         memory=False,
         urlopen=_urlopen_with_payload(payload),
     )

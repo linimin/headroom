@@ -25,6 +25,9 @@ PI_VERBOSE_ENV = "HEADROOM_PI_VERBOSE"
 PI_ATTACH_METADATA_PATH = "/headroom/meta"
 PI_PROXY_METADATA_FAMILY_ENV = "HEADROOM_PROXY_WRAP_PI_UPSTREAM_FAMILY"
 PI_PROXY_METADATA_CAPABILITY_ENV = "HEADROOM_PROXY_WRAP_PI_ATTACH_CAPABLE"
+PI_OPENAI_TARGET_API_URL_ENV = "OPENAI_TARGET_API_URL"
+PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV = "GITHUB_COPILOT_USE_TOKEN_EXCHANGE"
+PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV = "LITELLM_SUPPRESS_DEBUG_INFO"
 PI_EXTENSION_TEMPLATE_ASSET = "pi_extension_template.ts"
 PI_SUPPORTED_PROVIDERS = ("openai", "anthropic", "github-copilot")
 PI_DEFAULT_PROVIDER_ORDER = PI_SUPPORTED_PROVIDERS
@@ -39,6 +42,8 @@ class PiProviderSpec:
     family: str
     default_port: int
     routed_suffix: str
+    default_backend: str
+    proxy_env: Mapping[str, str] | None = None
 
     def root_url(self, port: int) -> str:
         return f"http://127.0.0.1:{port}"
@@ -81,18 +86,26 @@ def managed_provider_specs() -> dict[str, PiProviderSpec]:
             family="openai",
             default_port=8789,
             routed_suffix="/v1",
+            default_backend="openai",
         ),
         "anthropic": PiProviderSpec(
             provider_id="anthropic",
             family="anthropic",
             default_port=8790,
             routed_suffix="",
+            default_backend="anthropic",
         ),
         "github-copilot": PiProviderSpec(
             provider_id="github-copilot",
             family="openai",
             default_port=8788,
             routed_suffix="/v1",
+            default_backend="openai",
+            proxy_env={
+                PI_OPENAI_TARGET_API_URL_ENV: "https://api.githubcopilot.com",
+                PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
+                PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
+            },
         ),
     }
 
@@ -116,10 +129,19 @@ def resolve_pi_binary(which: Any = shutil.which) -> str:
 
 
 def resolve_pi_proxy_backend(backend: str | None) -> str:
-    """Resolve the backend a wrap-pi invocation expects for managed proxies."""
+    """Resolve the explicit wrap-pi backend override, if any."""
 
-    value = (backend or os.environ.get("HEADROOM_BACKEND") or "anthropic").strip()
-    return value or "anthropic"
+    value = (backend or os.environ.get("HEADROOM_BACKEND") or "").strip()
+    return value
+
+
+def resolve_pi_provider_backend(provider_id: str, backend: str | None) -> str:
+    """Resolve the backend a specific managed pi provider should use."""
+
+    explicit = resolve_pi_proxy_backend(backend)
+    if explicit:
+        return explicit
+    return managed_provider_specs()[provider_id].default_backend
 
 
 def resolve_managed_providers(providers: Sequence[str]) -> list[str]:
@@ -291,13 +313,16 @@ def build_pi_launch_args(pi_args: Sequence[str], extension_path: Path) -> tuple[
 
 
 def build_pi_proxy_metadata_env(provider_id: str) -> dict[str, str]:
-    """Return proxy env vars needed for wrap-pi attach metadata."""
+    """Return proxy env vars needed for wrap-pi attach metadata and provider-specific upstreams."""
 
     spec = managed_provider_specs()[provider_id]
-    return {
+    env = {
         PI_PROXY_METADATA_FAMILY_ENV: spec.family,
         PI_PROXY_METADATA_CAPABILITY_ENV: "1",
     }
+    if spec.proxy_env:
+        env.update(spec.proxy_env)
+    return env
 
 
 def _coerce_metadata_bool(value: object) -> bool | None:
@@ -385,7 +410,7 @@ def probe_attach_compatibility(
             reason=f"Metadata endpoint on port {port} returned an invalid payload.",
         )
 
-    expected_backend = resolve_pi_proxy_backend(backend)
+    expected_backend = resolve_pi_provider_backend(provider_id, backend)
     expected_family = managed_provider_specs()[provider_id].family
     if not metadata.attach_compatible or not metadata.wrap_pi:
         reason = f"Metadata on port {port} does not advertise wrap-pi attach compatibility."
