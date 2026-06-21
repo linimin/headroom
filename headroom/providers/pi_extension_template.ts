@@ -98,6 +98,7 @@ export default function (pi: ExtensionAPI) {
   const providerHealth = new Map<string, ProviderHealthState>();
   const providerPerf = new Map<string, PerfSummary>();
   const pendingProviderStarts = new Map<string, Promise<void>>();
+  const readyProviderStarts = new Set<string>();
 
   const normalizeProvider = (value: string | null | undefined): string | null => {
     if (!value) {
@@ -889,6 +890,7 @@ export default function (pi: ExtensionAPI) {
       let completionConfig: SessionConfig | null = null;
       let completionModel: ModelSnapshot | null = null;
       let completionNotify: string | null = null;
+      let startupSucceeded = false;
       try {
         await yieldToUi();
         await ensureManagedProvider(config, providerId, currentModel, {
@@ -906,6 +908,7 @@ export default function (pi: ExtensionAPI) {
             { skipBackgroundStart: true },
           );
           if (registeredProviders.has(providerId)) {
+            startupSucceeded = true;
             completionNotify = `Headroom ready for ${providerLabel(providerId, completionModel)}. Future requests now use the proxy.`;
           }
         } else {
@@ -913,6 +916,9 @@ export default function (pi: ExtensionAPI) {
         }
       } finally {
         pendingProviderStarts.delete(startKey);
+        if (startupSucceeded) {
+          readyProviderStarts.add(startKey);
+        }
         if (completionConfig) {
           updateUiStatus(completionConfig, ctx, completionModel);
           if (completionNotify) {
@@ -1013,17 +1019,20 @@ export default function (pi: ExtensionAPI) {
     let workingConfig = config;
     if (workingConfig.managedProviders.includes(providerId)) {
       const startNeeds = providerStartNeeds(workingConfig, providerId, currentModel);
+      const startKey = providerStartKey(providerId, currentModel);
       const shouldBackgroundStart =
         !options?.skipBackgroundStart &&
         workingConfig.autoManageCurrentProviderOnly &&
         ctx !== undefined &&
-        (startNeeds.needsMaterialize || startNeeds.needsCopilotVariantHydration);
+        (startNeeds.needsMaterialize || startNeeds.needsCopilotVariantHydration) &&
+        !readyProviderStarts.has(startKey);
       if (shouldBackgroundStart) {
         startManagedProviderInBackground(workingConfig, providerId, currentModel, reason, ctx);
         await unregisterProvider(workingConfig, providerId, `${reason}:background-starting`);
         return workingConfig;
       }
       workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel, {
+        force: readyProviderStarts.has(startKey),
         ctx,
       });
     }
