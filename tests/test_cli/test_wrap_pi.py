@@ -410,6 +410,54 @@ def test_start_proxy_suppresses_log_path_announcement_when_announce_false(
     assert echo_calls == []
 
 
+def test_start_or_attach_pi_proxy_waits_for_other_wrap_pi_startup_then_attaches(
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrap_cli, _main = wrap_modules
+    probes = [
+        SimpleNamespace(status="missing", reason="starting", metadata=None),
+        SimpleNamespace(
+            status="compatible",
+            reason="ok",
+            metadata=SimpleNamespace(
+                headroom_version="1.0.0",
+                backend="openai",
+                upstream_family="openai",
+                memory=False,
+            ),
+        ),
+    ]
+
+    class _FakeLock:
+        def __init__(self, acquired: bool) -> None:
+            self.acquired = acquired
+
+        def release(self) -> None:
+            return None
+
+    monkeypatch.setattr(wrap_cli.time, "sleep", lambda _seconds: None)
+    with (
+        patch("headroom.cli.wrap._probe_pi_attach_compatibility", side_effect=probes),
+        patch(
+            "headroom.cli.wrap._try_acquire_pi_proxy_startup_lock",
+            side_effect=[_FakeLock(False)],
+        ),
+        patch("headroom.cli.wrap._start_proxy") as start_proxy,
+    ):
+        state = wrap_cli._start_or_attach_pi_proxy(
+            "openai",
+            8789,
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+
+    assert state.ownership == "attached"
+    assert state.process is None
+    start_proxy.assert_not_called()
+
+
 def test_start_or_attach_pi_proxy_accepts_compatible_attach(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
@@ -507,7 +555,7 @@ def test_pi_wrap_control_server_replaces_stale_attached_proxy_with_owned_proxy(
     with (
         patch(
             "headroom.cli.wrap._probe_pi_attach_compatibility",
-            side_effect=[missing_probe, missing_probe],
+            side_effect=[missing_probe, missing_probe, missing_probe],
         ),
         patch("headroom.cli.wrap._port_bind_error", return_value=None),
         patch("headroom.cli.wrap._start_proxy", return_value=_FakeManagedProcess()),

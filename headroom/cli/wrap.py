@@ -5447,6 +5447,70 @@ def _pi_process_group_signal(proc: subprocess.Popen[Any], signum: int) -> None:
     proc.send_signal(signum)
 
 
+class _PiProxyStartupLock:
+    """Cross-process startup lock for one wrap-pi managed proxy port."""
+
+    def __init__(
+        self, *, port: int, acquired: bool, fd: Any | None = None, path: Path | None = None
+    ) -> None:
+        self.port = port
+        self.acquired = acquired
+        self._fd = fd
+        self._path = path
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fd.close()
+        except Exception:
+            pass
+        self._fd = None
+        if self._path is not None:
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _pi_proxy_startup_lock_path(port: int) -> Path:
+    """Return the lock path for coordinating wrap-pi startup on ``port``."""
+    from headroom import paths as _paths
+
+    return _paths.proxy_clients_dir(port) / ".pi-startup.lock"
+
+
+def _try_acquire_pi_proxy_startup_lock(port: int) -> _PiProxyStartupLock:
+    """Try to acquire the cross-process startup lock for ``port``."""
+
+    try:
+        import fcntl
+    except ImportError:
+        # Best-effort fallback on platforms without fcntl.
+        return _PiProxyStartupLock(port=port, acquired=True)
+
+    lock_path = _pi_proxy_startup_lock_path(port)
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(lock_path, "w")  # noqa: SIM115
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(str(os.getpid()))
+        fd.flush()
+        return _PiProxyStartupLock(port=port, acquired=True, fd=fd, path=lock_path)
+    except OSError:
+        if fd is not None:
+            fd.close()
+        return _PiProxyStartupLock(port=port, acquired=False, path=lock_path)
+
+
 def _cleanup_pi_wrap_session(
     pi_process: subprocess.Popen[Any] | None,
     proxies: Sequence[_PiManagedProxy],
@@ -5514,62 +5578,104 @@ def _start_or_attach_pi_proxy(
         model_api=model_api,
         model_id=model_id,
     )
-    attach_probe = _probe_pi_attach_compatibility(
-        provider_id,
-        port,
-        backend=provider_backend,
-        memory=memory,
-        expected_family=provider_family,
-    )
-    if attach_probe.status == "compatible":
-        if announce:
-            click.echo(f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}")
-            if verbose and attach_probe.metadata is not None:
-                click.echo(
-                    "   attach metadata: "
-                    f"version={attach_probe.metadata.headroom_version} "
-                    f"backend={attach_probe.metadata.backend} "
-                    f"family={attach_probe.metadata.upstream_family} "
-                    f"memory={attach_probe.metadata.memory}"
-                )
-        return _PiManagedProxy(
-            provider_id=provider_id,
-            port=port,
-            ownership="attached",
-            backend=provider_backend,
-            family=provider_family,
-            process=None,
-            variant=variant,
-        )
+    startup_deadline = time.monotonic() + _resolve_wrap_proxy_timeout_seconds()
 
-    bind_error = _port_bind_error(port)
-    if bind_error is not None:
-        if attach_probe.status == "incompatible":
-            raise click.ClickException(
-                f"Cannot attach pi provider {provider_id!r} on port {port}: {attach_probe.reason}"
-            )
-        raise click.ClickException(
-            f"Port {port} is already in use for pi provider {provider_id!r}, but attach compatibility "
-            f"could not be proven via /headroom/meta. Stop the existing process or choose a different port."
-        )
-
-    if announce:
-        click.echo(f" Starting Headroom proxy for {provider_id} on port {port}...")
-    proc = cast(
-        subprocess.Popen[Any],
-        _start_proxy(
+    while True:
+        attach_probe = _probe_pi_attach_compatibility(
+            provider_id,
             port,
-            memory=memory,
-            agent_type="pi",
             backend=provider_backend,
-            extra_env=_build_pi_proxy_metadata_env(
-                provider_id,
+            memory=memory,
+            expected_family=provider_family,
+        )
+        if attach_probe.status == "compatible":
+            if announce:
+                click.echo(
+                    f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}"
+                )
+                if verbose and attach_probe.metadata is not None:
+                    click.echo(
+                        "   attach metadata: "
+                        f"version={attach_probe.metadata.headroom_version} "
+                        f"backend={attach_probe.metadata.backend} "
+                        f"family={attach_probe.metadata.upstream_family} "
+                        f"memory={attach_probe.metadata.memory}"
+                    )
+            return _PiManagedProxy(
+                provider_id=provider_id,
+                port=port,
+                ownership="attached",
                 backend=provider_backend,
                 family=provider_family,
-            ),
-            announce=announce,
-        ),
-    )
+                process=None,
+                variant=variant,
+            )
+
+        startup_lock = _try_acquire_pi_proxy_startup_lock(port)
+        if not startup_lock.acquired:
+            if time.monotonic() >= startup_deadline:
+                bind_error = _port_bind_error(port)
+                if bind_error is not None and attach_probe.status == "incompatible":
+                    raise click.ClickException(
+                        f"Cannot attach pi provider {provider_id!r} on port {port}: {attach_probe.reason}"
+                    )
+                raise click.ClickException(
+                    f"Timed out waiting for another wrap-pi session to finish starting port {port} "
+                    f"for provider {provider_id!r}."
+                )
+            time.sleep(0.25)
+            continue
+
+        try:
+            attach_probe = _probe_pi_attach_compatibility(
+                provider_id,
+                port,
+                backend=provider_backend,
+                memory=memory,
+                expected_family=provider_family,
+            )
+            if attach_probe.status == "compatible":
+                return _PiManagedProxy(
+                    provider_id=provider_id,
+                    port=port,
+                    ownership="attached",
+                    backend=provider_backend,
+                    family=provider_family,
+                    process=None,
+                    variant=variant,
+                )
+
+            bind_error = _port_bind_error(port)
+            if bind_error is not None:
+                if attach_probe.status == "incompatible":
+                    raise click.ClickException(
+                        f"Cannot attach pi provider {provider_id!r} on port {port}: {attach_probe.reason}"
+                    )
+                raise click.ClickException(
+                    f"Port {port} is already in use for pi provider {provider_id!r}, but attach compatibility "
+                    f"could not be proven via /headroom/meta. Stop the existing process or choose a different port."
+                )
+
+            if announce:
+                click.echo(f" Starting Headroom proxy for {provider_id} on port {port}...")
+            proc = cast(
+                subprocess.Popen[Any],
+                _start_proxy(
+                    port,
+                    memory=memory,
+                    agent_type="pi",
+                    backend=provider_backend,
+                    extra_env=_build_pi_proxy_metadata_env(
+                        provider_id,
+                        backend=provider_backend,
+                        family=provider_family,
+                    ),
+                    announce=announce,
+                ),
+            )
+            break
+        finally:
+            startup_lock.release()
     if announce and verbose:
         click.echo(f"   ownership=owned backend={provider_backend}")
     return _PiManagedProxy(
