@@ -881,33 +881,44 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const label = providerLabel(providerId, currentModel);
+    const initialLabel = providerLabel(providerId, currentModel);
     setStatusText(ctx, startupStatusLine(providerId));
-    notifyUiSoon(ctx, `Headroom starting ${label} in background...`, "info", 0);
+    notifyUiSoon(ctx, `Headroom starting ${initialLabel} in background...`, "info", 0);
 
     const pending = (async () => {
+      let completionConfig: SessionConfig | null = null;
+      let completionModel: ModelSnapshot | null = null;
+      let completionNotify: string | null = null;
       try {
         await yieldToUi();
         await ensureManagedProvider(config, providerId, currentModel, {
           force: true,
         });
-        const latestModel = getCurrentModel(ctx);
+        completionModel = getCurrentModel(ctx);
         const latestConfig = await loadConfig();
-        const latestResolution = getResolution(latestModel);
+        const latestResolution = getResolution(completionModel);
         if (latestResolution.providerId === providerId) {
-          const synced = await syncCurrentProvider(
+          completionConfig = await syncCurrentProvider(
             latestConfig,
-            latestModel,
+            completionModel,
             `${reason}:background_ready`,
             ctx,
             { skipBackgroundStart: true },
           );
-          updateUiStatus(synced, ctx, latestModel);
+          if (registeredProviders.has(providerId)) {
+            completionNotify = `Headroom ready for ${providerLabel(providerId, completionModel)}. Future requests now use the proxy.`;
+          }
         } else {
-          updateUiStatus(latestConfig, ctx, latestModel);
+          completionConfig = latestConfig;
         }
       } finally {
         pendingProviderStarts.delete(startKey);
+        if (completionConfig) {
+          updateUiStatus(completionConfig, ctx, completionModel);
+          if (completionNotify) {
+            notifyUiSoon(ctx, completionNotify, "info");
+          }
+        }
       }
     })();
     pendingProviderStarts.set(startKey, pending);
