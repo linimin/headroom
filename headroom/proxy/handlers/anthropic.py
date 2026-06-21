@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
-from headroom.copilot_auth import build_copilot_upstream_url
+from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.compression_decision import CompressionDecision
@@ -2129,6 +2129,8 @@ class AnthropicHandlerMixin:
             )
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
+
+            headers = await apply_copilot_api_auth(headers, url=url)
 
             try:
                 if stream:
