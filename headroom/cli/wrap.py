@@ -131,6 +131,7 @@ from headroom.providers.pi import (
 )
 from headroom.providers.pi import build_pi_launch_args as _build_pi_launch_args
 from headroom.providers.pi import build_pi_launch_env as _build_pi_launch_env
+from headroom.providers.pi import build_pi_provider_payload as _build_pi_provider_payload
 from headroom.providers.pi import (
     build_pi_proxy_metadata_env as _build_pi_proxy_metadata_env,
 )
@@ -142,6 +143,7 @@ from headroom.providers.pi import render_pi_extension as _render_pi_extension
 from headroom.providers.pi import resolve_managed_providers as _resolve_pi_managed_providers
 from headroom.providers.pi import resolve_pi_binary as _resolve_pi_binary
 from headroom.providers.pi import resolve_pi_provider_backend as _resolve_pi_provider_backend
+from headroom.providers.pi import resolve_pi_provider_family as _resolve_pi_provider_family
 from headroom.providers.pi import resolve_pi_proxy_backend as _resolve_pi_proxy_backend
 from headroom.providers.pi import resolve_provider_ports as _resolve_pi_provider_ports
 from headroom.providers.pi import write_pi_session_config as _write_pi_session_config
@@ -5091,6 +5093,8 @@ class _PiManagedProxy:
     provider_id: str
     port: int
     ownership: Literal["owned", "attached"]
+    backend: str
+    family: str
     process: subprocess.Popen[Any] | None = None
 
 
@@ -5130,7 +5134,13 @@ class _PiWrapControlServer:
                     provider_id = str(payload.get("providerId") or "").strip().lower()
                     if provider_id not in _PI_SUPPORTED_PROVIDERS:
                         raise click.ClickException(f"Unsupported pi provider {provider_id!r}.")
-                    provider_payload = owner.ensure_provider(provider_id)
+                    model_api = payload.get("modelApi")
+                    model_id = payload.get("modelId")
+                    provider_payload = owner.ensure_provider(
+                        provider_id,
+                        model_api=str(model_api) if isinstance(model_api, str) else None,
+                        model_id=str(model_id) if isinstance(model_id, str) else None,
+                    )
                     body = json.dumps({"ok": True, "provider": provider_payload}).encode("utf-8")
                     self.send_response(200)
                     self.send_header("content-type", "application/json")
@@ -5157,23 +5167,56 @@ class _PiWrapControlServer:
         host, port = self._server.server_address[:2]
         return f"http://{host}:{port}"
 
-    def ensure_provider(self, provider_id: str) -> dict[str, Any]:
+    def ensure_provider(
+        self,
+        provider_id: str,
+        *,
+        model_api: str | None = None,
+        model_id: str | None = None,
+    ) -> dict[str, Any]:
+        desired_backend = _resolve_pi_provider_backend(
+            provider_id,
+            self._backend,
+            model_api=model_api,
+            model_id=model_id,
+        )
+        desired_family = _resolve_pi_provider_family(
+            provider_id,
+            backend=desired_backend,
+            model_api=model_api,
+            model_id=model_id,
+        )
         with self._lock:
-            for proxy in self._proxies:
-                if proxy.provider_id == provider_id:
+            for index, proxy in enumerate(self._proxies):
+                if proxy.provider_id != provider_id:
+                    continue
+                if proxy.backend == desired_backend and proxy.family == desired_family:
                     return cast(dict[str, Any], self._session_config["providers"][provider_id])
+                if proxy.ownership == "owned" and proxy.process is not None:
+                    _cleanup_pi_wrap_session(None, [proxy])
+                    del self._proxies[index]
+                    break
+                raise click.ClickException(
+                    f"Existing attached proxy for {provider_id!r} uses backend={proxy.backend!r}, family={proxy.family!r}; "
+                    f"cannot switch to backend={desired_backend!r}, family={desired_family!r} on the same port."
+                )
             proxy = _start_or_attach_pi_proxy(
                 provider_id,
                 self._provider_ports[provider_id],
-                backend=self._backend,
+                backend=desired_backend,
+                family=desired_family,
                 memory=self._memory,
                 verbose=self._verbose,
+                model_api=model_api,
+                model_id=model_id,
             )
             self._proxies.append(proxy)
-            provider_payload = _build_pi_wrap_session_config(
-                [provider_id],
-                {provider_id: self._provider_ports[provider_id]},
-            )["providers"][provider_id]
+            provider_payload = _build_pi_provider_payload(
+                provider_id,
+                self._provider_ports[provider_id],
+                backend=desired_backend,
+                family=desired_family,
+            )
             provider_payload["ownership"] = proxy.ownership
             cast(dict[str, Any], self._session_config["providers"])[provider_id] = provider_payload
             self._session_config_path.write_text(
@@ -5249,17 +5292,32 @@ def _start_or_attach_pi_proxy(
     port: int,
     *,
     backend: str | None,
+    family: str | None = None,
     memory: bool,
     verbose: bool,
+    model_api: str | None = None,
+    model_id: str | None = None,
 ) -> _PiManagedProxy:
     """Return proxy ownership state for one managed pi provider."""
 
-    provider_backend = _resolve_pi_provider_backend(provider_id, backend)
+    provider_backend = _resolve_pi_provider_backend(
+        provider_id,
+        backend,
+        model_api=model_api,
+        model_id=model_id,
+    )
+    provider_family = family or _resolve_pi_provider_family(
+        provider_id,
+        backend=provider_backend,
+        model_api=model_api,
+        model_id=model_id,
+    )
     attach_probe = _probe_pi_attach_compatibility(
         provider_id,
         port,
         backend=provider_backend,
         memory=memory,
+        expected_family=provider_family,
     )
     if attach_probe.status == "compatible":
         click.echo(f" Reusing compatible proxy for {provider_id} on http://127.0.0.1:{port}")
@@ -5275,6 +5333,8 @@ def _start_or_attach_pi_proxy(
             provider_id=provider_id,
             port=port,
             ownership="attached",
+            backend=provider_backend,
+            family=provider_family,
             process=None,
         )
 
@@ -5297,7 +5357,11 @@ def _start_or_attach_pi_proxy(
             memory=memory,
             agent_type="pi",
             backend=provider_backend,
-            extra_env=_build_pi_proxy_metadata_env(provider_id),
+            extra_env=_build_pi_proxy_metadata_env(
+                provider_id,
+                backend=provider_backend,
+                family=provider_family,
+            ),
         ),
     )
     if verbose:
@@ -5306,6 +5370,8 @@ def _start_or_attach_pi_proxy(
         provider_id=provider_id,
         port=port,
         ownership="owned",
+        backend=provider_backend,
+        family=provider_family,
         process=proc,
     )
 
@@ -5437,24 +5503,27 @@ def pi(
             )
             for proxy in proxies:
                 session_config["providers"][proxy.provider_id]["ownership"] = proxy.ownership
+                session_config["providers"][proxy.provider_id]["backend"] = proxy.backend
+                session_config["providers"][proxy.provider_id]["family"] = proxy.family
+                if proxy.family == "anthropic":
+                    session_config["providers"][proxy.provider_id]["routedBaseUrl"] = session_config["providers"][proxy.provider_id]["rootUrl"]
             if not providers:
                 session_config["providers"] = {}
             session_config_path = _write_pi_session_config(temp_dir, session_config)
-            if not providers:
-                control_server = _PiWrapControlServer(
-                    session_config_path=session_config_path,
-                    session_config=session_config,
-                    proxies=proxies,
-                    provider_ports=provider_ports,
-                    backend=resolved_backend,
-                    memory=memory,
-                    verbose=verbose,
-                )
-                session_config["controlUrl"] = control_server.url
-                session_config_path.write_text(
-                    json.dumps(session_config, indent=2) + "\n",
-                    encoding="utf-8",
-                )
+            control_server = _PiWrapControlServer(
+                session_config_path=session_config_path,
+                session_config=session_config,
+                proxies=proxies,
+                provider_ports=provider_ports,
+                backend=resolved_backend,
+                memory=memory,
+                verbose=verbose,
+            )
+            session_config["controlUrl"] = control_server.url
+            session_config_path.write_text(
+                json.dumps(session_config, indent=2) + "\n",
+                encoding="utf-8",
+            )
             env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
 
             _print_wrap_banner("pi")

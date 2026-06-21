@@ -112,7 +112,7 @@ def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_e
     fake_proc = _FakePiProcess()
 
     def fake_start_pi_managed_proxies(*args, **kwargs):
-        return [wrap_cli._PiManagedProxy("openai", 8789, "owned")]
+        return [wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai")]
 
     def fake_popen(command: list[str], env: dict[str, str], start_new_session: bool):
         captured["command"] = command
@@ -196,7 +196,7 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
         captured["managed_providers"] = managed_providers
         captured["provider_ports"] = provider_ports
         captured["kwargs"] = kwargs
-        return [wrap_cli._PiManagedProxy("github-copilot", 9911, "attached")]
+        return [wrap_cli._PiManagedProxy("github-copilot", 9911, "attached", "openai", "openai")]
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
@@ -386,8 +386,8 @@ def test_cleanup_pi_wrap_session_stops_pi_then_only_owned_proxies(
     wrap_cli._cleanup_pi_wrap_session(
         pi_proc,
         [
-            wrap_cli._PiManagedProxy("openai", 8789, "owned", owned_proc),
-            wrap_cli._PiManagedProxy("anthropic", 8790, "attached", attached_proc),
+            wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", owned_proc),
+            wrap_cli._PiManagedProxy("anthropic", 8790, "attached", "anthropic", "anthropic", attached_proc),
         ],
         forwarded_signal=wrap_cli.signal.SIGINT,
     )
@@ -401,7 +401,7 @@ def test_start_pi_managed_proxies_cleans_up_owned_proxies_after_partial_failure(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
     wrap_cli, _main = wrap_modules
-    first_proxy = wrap_cli._PiManagedProxy("openai", 8789, "owned", _FakeManagedProcess())
+    first_proxy = wrap_cli._PiManagedProxy("openai", 8789, "owned", "openai", "openai", _FakeManagedProcess())
     cleanup_calls: list[list[str]] = []
 
     def fake_start_or_attach(provider_id: str, *args, **kwargs):

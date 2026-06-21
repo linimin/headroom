@@ -10,6 +10,7 @@ interface SessionProviderConfig {
   rootUrl: string;
   routedBaseUrl: string;
   family: string;
+  backend?: string;
 }
 
 interface SessionHealthConfig {
@@ -418,15 +419,35 @@ export default function (pi: ExtensionAPI) {
   const ensureManagedProvider = async (
     config: SessionConfig,
     providerId: string,
+    currentModel: ModelSnapshot | null,
   ): Promise<SessionConfig> => {
-    if (!config.autoManageCurrentProviderOnly || !config.controlUrl || config.providers[providerId]) {
+    const desiredBackend = providerId === "github-copilot" && currentModel?.api === "anthropic-messages"
+      ? "anthropic"
+      : providerId === "github-copilot" && (currentModel?.id.toLowerCase().startsWith("claude") || currentModel?.id.toLowerCase().includes("claude-"))
+        ? "anthropic"
+        : providerId === "github-copilot"
+          ? "openai"
+          : null;
+    const desiredFamily = desiredBackend === "anthropic" ? "anthropic" : null;
+    const existing = config.providers[providerId];
+    const needsMaterialize = config.autoManageCurrentProviderOnly && !existing;
+    const needsReconcile =
+      providerId === "github-copilot" &&
+      !!existing &&
+      !!desiredBackend &&
+      (existing.backend !== desiredBackend || (desiredFamily && existing.family !== desiredFamily));
+    if ((!needsMaterialize && !needsReconcile) || !config.controlUrl) {
       return config;
     }
     try {
       const response = await fetch(`${config.controlUrl}/ensure-provider`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ providerId }),
+        body: JSON.stringify({
+          providerId,
+          modelApi: currentModel?.api ?? null,
+          modelId: currentModel?.id ?? null,
+        }),
       });
       if (!response.ok) {
         return config;
@@ -674,8 +695,8 @@ export default function (pi: ExtensionAPI) {
     await unregisterOtherProviders(config, providerId, `${reason}:switched-provider`);
 
     let workingConfig = config;
-    if (workingConfig.managedProviders.includes(providerId) && !workingConfig.providers[providerId]) {
-      workingConfig = await ensureManagedProvider(workingConfig, providerId);
+    if (workingConfig.managedProviders.includes(providerId)) {
+      workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel);
     }
 
     const managedConfig = workingConfig.providers[providerId];
