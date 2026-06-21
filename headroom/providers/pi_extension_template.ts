@@ -584,6 +584,14 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const setStatusText = (ctx: ExtensionContext, text: string): void => {
+    try {
+      ctx.ui?.setStatus?.(STATUS_SLOT, text);
+    } catch {
+      // Footer status is best-effort only.
+    }
+  };
+
   const notifyUi = (
     ctx: ExtensionContext,
     message: string,
@@ -682,6 +690,15 @@ export default function (pi: ExtensionAPI) {
     }
     const variantKey = desiredVariantKeyForModel(providerId, currentModel) ?? targetConfig.family;
     return `${providerId} (${variantKey})`;
+  };
+
+  const selfHealStatusLine = (providerId: string): string =>
+    `Headroom:${shortProviderLabel(providerId)} recover`;
+
+  const yieldToUi = async (delayMs = 0): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.max(0, delayMs));
+    });
   };
 
   const registerProvider = async (
@@ -805,6 +822,7 @@ export default function (pi: ExtensionAPI) {
     if (shouldAttemptSelfHeal) {
       const previousOwnership = targetConfig.ownership ?? null;
       const previousRootUrl = targetConfig.rootUrl;
+      const label = selfHealLabel(providerId, targetConfig, currentModel);
       await logEvent(workingConfig, "provider_self_heal_attempt", {
         providerId,
         reason,
@@ -814,6 +832,11 @@ export default function (pi: ExtensionAPI) {
         previousStatus: healthState.status,
         variantKey: desiredVariantKeyForModel(providerId, currentModel),
       });
+      if (ctx) {
+        setStatusText(ctx, selfHealStatusLine(providerId));
+        notifyUiSoon(ctx, `Headroom reconnecting ${label}...`, "info", 0);
+        await yieldToUi();
+      }
       workingConfig = await ensureManagedProvider(workingConfig, providerId, currentModel, {
         force: true,
       });
@@ -838,12 +861,13 @@ export default function (pi: ExtensionAPI) {
           variantKey: desiredVariantKeyForModel(providerId, currentModel),
         });
         if (ctx && healthState.status === "healthy") {
-          const label = selfHealLabel(providerId, targetConfig, currentModel);
           if (previousOwnership === "attached" && targetConfig.ownership === "owned") {
             notifyUiSoon(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
           } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
             notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
           }
+        } else if (ctx) {
+          notifyUiSoon(ctx, `Headroom could not recover ${label}.`, "warn");
         }
       }
     }
