@@ -704,6 +704,20 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  const waitForRecoveredHealth = async (
+    config: SessionConfig,
+    providerId: string,
+    managedConfig: SessionProviderRouteConfig,
+    reason: string,
+  ): Promise<ProviderHealthState> => {
+    let state = await refreshProviderHealth(config, providerId, managedConfig, reason, true);
+    for (let attempt = 0; attempt < 12 && state.status !== "healthy"; attempt += 1) {
+      await yieldToUi(100);
+      state = await refreshProviderHealth(config, providerId, managedConfig, reason, true);
+    }
+    return state;
+  };
+
   const registerProvider = async (
     config: SessionConfig,
     providerId: string,
@@ -847,12 +861,11 @@ export default function (pi: ExtensionAPI) {
       if (healedManagedConfig) {
         managedConfig = healedManagedConfig;
         targetConfig = resolveProviderTargetConfig(providerId, healedManagedConfig, currentModel);
-        healthState = await refreshProviderHealth(
+        healthState = await waitForRecoveredHealth(
           workingConfig,
           providerId,
           targetConfig,
           `${reason}:self_heal`,
-          true,
         );
         await logEvent(workingConfig, "provider_self_heal_result", {
           providerId,
@@ -869,7 +882,7 @@ export default function (pi: ExtensionAPI) {
           } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
             notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
           }
-        } else if (ctx) {
+        } else if (ctx && healthState.status === "unavailable") {
           notifyUiSoon(ctx, `Headroom could not recover ${label}.`, "warn");
         }
       }
