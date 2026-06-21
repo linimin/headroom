@@ -596,6 +596,17 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  const notifyUiSoon = (
+    ctx: ExtensionContext,
+    message: string,
+    level: "info" | "warn" | "error" = "info",
+    delayMs = 75,
+  ): void => {
+    setTimeout(() => {
+      notifyUi(ctx, message, level);
+    }, Math.max(0, delayMs));
+  };
+
   const statusLines = (
     config: SessionConfig,
     currentModel: ModelSnapshot | null,
@@ -829,9 +840,9 @@ export default function (pi: ExtensionAPI) {
         if (ctx && healthState.status === "healthy") {
           const label = selfHealLabel(providerId, targetConfig, currentModel);
           if (previousOwnership === "attached" && targetConfig.ownership === "owned") {
-            notifyUi(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
+            notifyUiSoon(ctx, `Headroom took over ${label} on port ${targetConfig.port}.`, "info");
           } else if (previousRootUrl !== targetConfig.rootUrl || previousOwnership !== targetConfig.ownership) {
-            notifyUi(ctx, `Headroom reattached ${label}.`, "info");
+            notifyUiSoon(ctx, `Headroom reattached ${label}.`, "info");
           }
         }
       }
