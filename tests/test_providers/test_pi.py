@@ -100,12 +100,17 @@ def test_build_pi_copilot_provider_payload_contains_both_wire_variants() -> None
     assert payload["variants"]["anthropic"]["routedBaseUrl"] == "http://127.0.0.1:8791"
 
 
-def test_build_pi_launch_env_sets_session_config_and_optional_verbose(tmp_path: Path) -> None:
+def test_build_pi_launch_env_sets_session_config_extension_path_and_optional_verbose(
+    tmp_path: Path,
+) -> None:
     session_path = tmp_path / "session.json"
-    quiet_env = pi_mod.build_pi_launch_env({}, session_path, verbose=False)
-    loud_env = pi_mod.build_pi_launch_env({}, session_path, verbose=True)
+    extension_path = tmp_path / "extension.ts"
+    quiet_env = pi_mod.build_pi_launch_env({}, session_path, extension_path, verbose=False)
+    loud_env = pi_mod.build_pi_launch_env({}, session_path, extension_path, verbose=True)
     assert quiet_env[pi_mod.PI_SESSION_CONFIG_ENV] == str(session_path)
+    assert quiet_env[pi_mod.PI_EXTENSION_PATH_ENV] == str(extension_path)
     assert pi_mod.PI_VERBOSE_ENV not in quiet_env
+    assert loud_env[pi_mod.PI_EXTENSION_PATH_ENV] == str(extension_path)
     assert loud_env[pi_mod.PI_VERBOSE_ENV] == "1"
 
 

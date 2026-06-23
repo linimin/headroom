@@ -5863,7 +5863,12 @@ def pi(
                 json.dumps(session_config, indent=2) + "\n",
                 encoding="utf-8",
             )
-            env = _build_pi_launch_env(os.environ, session_config_path, verbose=verbose)
+            env = _build_pi_launch_env(
+                os.environ,
+                session_config_path,
+                extension_path,
+                verbose=verbose,
+            )
 
             _print_wrap_banner("pi")
             click.echo()

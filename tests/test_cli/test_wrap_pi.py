@@ -14,7 +14,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from headroom.providers.pi import PI_SESSION_CONFIG_ENV
+from headroom.providers.pi import PI_EXTENSION_PATH_ENV, PI_SESSION_CONFIG_ENV
 
 
 @pytest.fixture
@@ -139,6 +139,7 @@ def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_e
     assert result.exit_code == 0, result.output
     assert captured["command"][0] == "/fake/bin/pi"
     assert captured["command"].count("--extension") == 1
+    assert captured["env"][PI_EXTENSION_PATH_ENV] == captured["command"][captured["command"].index("--extension") + 1]
     assert captured["session_config"]["managedProviders"] == ["openai"]
     assert captured["session_config"]["providers"]["openai"]["ownership"] == "owned"
     assert "HEADROOM_PI_SESSION_CONFIG" in captured["extension_contents"]
@@ -192,6 +193,7 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
         "anthropic",
         "github-copilot",
     ]
+    assert captured["env"][PI_EXTENSION_PATH_ENV] == captured["command"][captured["command"].index("--extension") + 1]
     assert captured["session_config"]["providers"] == {}
     assert captured["session_config"]["autoManageCurrentProviderOnly"] is True
     assert captured["session_config"]["controlUrl"].startswith("http://127.0.0.1:")

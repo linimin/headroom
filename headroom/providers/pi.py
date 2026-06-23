@@ -21,6 +21,7 @@ import click
 from headroom._version import __version__
 
 PI_SESSION_CONFIG_ENV = "HEADROOM_PI_SESSION_CONFIG"
+PI_EXTENSION_PATH_ENV = "HEADROOM_PI_EXTENSION_PATH"
 PI_VERBOSE_ENV = "HEADROOM_PI_VERBOSE"
 PI_ATTACH_METADATA_PATH = "/headroom/meta"
 PI_PROXY_METADATA_FAMILY_ENV = "HEADROOM_PROXY_WRAP_PI_UPSTREAM_FAMILY"
@@ -400,6 +401,7 @@ def render_pi_extension(temp_dir: Path, session_config_path: Path) -> Path:
 def build_pi_launch_env(
     base_env: Mapping[str, str],
     session_config_path: Path,
+    extension_path: Path,
     *,
     verbose: bool,
 ) -> dict[str, str]:
@@ -407,6 +409,7 @@ def build_pi_launch_env(
 
     env = dict(base_env)
     env[PI_SESSION_CONFIG_ENV] = str(session_config_path)
+    env[PI_EXTENSION_PATH_ENV] = str(extension_path)
     if verbose:
         env[PI_VERBOSE_ENV] = "1"
     else:
