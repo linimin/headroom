@@ -92,6 +92,7 @@ const HEALTH_PATHS = ["/health", "/readyz", "/livez"];
 const MANAGED_PROVIDER_PREFIXES = ["openai", "anthropic", "github-copilot"];
 const STATUS_SLOT = "headroom-wrap-pi";
 const STATUS_COMMAND = "headroom-status";
+const CONTROL_PLANE_TIMEOUT_MS = 95_000;
 
 export default function (pi: ExtensionAPI) {
   const registeredProviders = new Map<string, string>();
@@ -512,15 +513,18 @@ export default function (pi: ExtensionAPI) {
       return config;
     }
 
+    const label = providerLabel(providerId, currentModel);
     if (ctx && !force && (needsMaterialize || needsCopilotVariantHydration)) {
-      const label = providerLabel(providerId, currentModel);
       setStatusText(ctx, startupStatusLine(providerId));
       notifyUiSoon(ctx, `Headroom starting ${label}...`, "info", 0);
       await yieldToUi();
     }
 
     const maxEnsureAttempts = force ? 8 : 1;
+    let lastError: string | null = null;
     for (let attempt = 0; attempt < maxEnsureAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeoutHandle = setTimeout(() => controller.abort(), CONTROL_PLANE_TIMEOUT_MS);
       try {
         const response = await fetch(`${config.controlUrl}/ensure-provider`, {
           method: "POST",
@@ -530,18 +534,57 @@ export default function (pi: ExtensionAPI) {
             modelApi: currentModel?.api ?? null,
             modelId: currentModel?.id ?? null,
           }),
+          signal: controller.signal,
         });
         if (response.ok) {
           return await loadConfig();
         }
-      } catch {
-        // Best-effort only; force mode retries transient control-plane failures.
+
+        let detail = `HTTP ${response.status}`;
+        try {
+          const raw = (await response.text()).trim();
+          if (raw) {
+            try {
+              const parsed = JSON.parse(raw) as { error?: unknown };
+              if (typeof parsed.error === "string" && parsed.error.trim()) {
+                detail = parsed.error.trim();
+              } else {
+                detail = raw;
+              }
+            } catch {
+              detail = raw;
+            }
+          }
+        } catch {
+          // Keep the status-derived detail above.
+        }
+        lastError = detail;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      } finally {
+        clearTimeout(timeoutHandle);
       }
       if (attempt + 1 < maxEnsureAttempts) {
         await new Promise<void>((resolve) => {
           setTimeout(resolve, force ? 250 : 0);
         });
       }
+    }
+
+    await logEvent(config, "provider_ensure_failed", {
+      providerId,
+      currentModel,
+      force,
+      variantKey: desiredVariant,
+      lastError,
+    });
+    if (ctx) {
+      updateUiStatus(config, ctx, currentModel);
+      notifyUiSoon(
+        ctx,
+        `Headroom could not start ${label}${lastError ? `: ${lastError}` : "."}`,
+        "error",
+      );
     }
     return config;
   };
