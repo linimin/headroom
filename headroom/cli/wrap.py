@@ -5740,7 +5740,7 @@ def _start_pi_managed_proxies(
     "providers",
     multiple=True,
     type=click.Choice(_PI_SUPPORTED_PROVIDERS, case_sensitive=False),
-    help="Managed pi provider (repeatable: openai, anthropic, github-copilot). Omit to lazy-manage only the current provider.",
+    help="Managed pi provider (repeatable: openai, anthropic, github-copilot, xai). Omit to lazy-manage only the current provider.",
 )
 @click.option(
     "--port",

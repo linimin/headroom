@@ -89,7 +89,7 @@ interface ProviderHealthState {
 }
 
 const HEALTH_PATHS = ["/health", "/readyz", "/livez"];
-const MANAGED_PROVIDER_PREFIXES = ["openai", "anthropic", "github-copilot"];
+const MANAGED_PROVIDER_PREFIXES = ["openai", "anthropic", "github-copilot", "xai"];
 const STATUS_SLOT = "headroom-wrap-pi";
 const STATUS_COMMAND = "headroom-status";
 const CONTROL_PLANE_TIMEOUT_MS = 95_000;

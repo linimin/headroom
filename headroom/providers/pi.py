@@ -27,10 +27,11 @@ PI_ATTACH_METADATA_PATH = "/headroom/meta"
 PI_PROXY_METADATA_FAMILY_ENV = "HEADROOM_PROXY_WRAP_PI_UPSTREAM_FAMILY"
 PI_PROXY_METADATA_CAPABILITY_ENV = "HEADROOM_PROXY_WRAP_PI_ATTACH_CAPABLE"
 PI_OPENAI_TARGET_API_URL_ENV = "OPENAI_TARGET_API_URL"
+PI_XAI_TARGET_API_URL_ENV = "XAI_TARGET_API_URL"
 PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV = "GITHUB_COPILOT_USE_TOKEN_EXCHANGE"
 PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV = "LITELLM_SUPPRESS_DEBUG_INFO"
 PI_EXTENSION_TEMPLATE_ASSET = "pi_extension_template.ts"
-PI_SUPPORTED_PROVIDERS = ("openai", "anthropic", "github-copilot")
+PI_SUPPORTED_PROVIDERS = ("openai", "anthropic", "github-copilot", "xai")
 PI_DEFAULT_PROVIDER_ORDER = PI_SUPPORTED_PROVIDERS
 PI_PHASE0_PROBE_TIMEOUT_SECONDS = 60
 PI_COPILOT_DEFAULT_VARIANT = "openai"
@@ -109,6 +110,13 @@ def managed_provider_specs() -> dict[str, PiProviderSpec]:
                 PI_GITHUB_COPILOT_USE_TOKEN_EXCHANGE_ENV: "0",
                 PI_LITELLM_SUPPRESS_DEBUG_INFO_ENV: "True",
             },
+        ),
+        "xai": PiProviderSpec(
+            provider_id="xai",
+            family="openai",
+            default_port=8791,
+            routed_suffix="/v1",
+            default_backend="openai",
         ),
     }
 
@@ -482,6 +490,9 @@ def build_pi_proxy_metadata_env(
             )
         elif spec.proxy_env:
             env.update(spec.proxy_env)
+    elif provider_id == "xai":
+        xai_target = os.environ.get(PI_XAI_TARGET_API_URL_ENV) or "https://api.x.ai/v1"
+        env[PI_OPENAI_TARGET_API_URL_ENV] = xai_target
     elif spec.proxy_env:
         env.update(spec.proxy_env)
     return env
