@@ -116,7 +116,7 @@ def managed_provider_specs() -> dict[str, PiProviderSpec]:
             family="openai",
             default_port=8791,
             routed_suffix="/v1",
-            default_backend="openai",
+            default_backend="xai",
         ),
     }
 

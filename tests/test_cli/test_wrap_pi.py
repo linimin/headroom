@@ -523,6 +523,38 @@ def test_start_or_attach_pi_proxy_uses_provider_default_backend_and_copilot_env(
     assert captured["kwargs"]["extra_env"]["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] == "0"
 
 
+def test_start_or_attach_pi_proxy_uses_xai_backend_for_xai_provider(
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    wrap_cli, _main = wrap_modules
+    captured: dict[str, object] = {}
+
+    def fake_start_proxy(port: int, **kwargs):
+        captured["port"] = port
+        captured["kwargs"] = kwargs
+        return _FakeManagedProcess()
+
+    probe = SimpleNamespace(status="missing", reason="missing metadata", metadata=None)
+
+    with (
+        patch("headroom.cli.wrap._probe_pi_attach_compatibility", return_value=probe),
+        patch("headroom.cli.wrap._port_bind_error", return_value=None),
+        patch("headroom.cli.wrap._start_proxy", side_effect=fake_start_proxy),
+    ):
+        state = wrap_cli._start_or_attach_pi_proxy(
+            "xai",
+            8791,
+            backend=None,
+            memory=False,
+            verbose=False,
+        )
+
+    assert state.ownership == "owned"
+    assert captured["port"] == 8791
+    assert captured["kwargs"]["backend"] == "xai"
+    assert captured["kwargs"]["extra_env"]["OPENAI_TARGET_API_URL"] == "https://api.x.ai/v1"
+
+
 def test_start_or_attach_pi_proxy_rejects_incompatible_attach(
     wrap_modules: tuple[types.ModuleType, click.Group],
 ) -> None:
