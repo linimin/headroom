@@ -20,7 +20,12 @@ from headroom.providers import pi as pi_mod
 
 
 def test_resolve_managed_providers_defaults_to_v1_set() -> None:
-    assert pi_mod.resolve_managed_providers(()) == ["openai", "anthropic", "github-copilot"]
+    assert pi_mod.resolve_managed_providers(()) == [
+        "openai",
+        "anthropic",
+        "github-copilot",
+        "xai",
+    ]
 
 
 def test_resolve_managed_providers_dedupes_preserving_order() -> None:
@@ -105,10 +110,19 @@ def test_build_pi_launch_env_sets_session_config_extension_path_and_optional_ver
 ) -> None:
     session_path = tmp_path / "session.json"
     extension_path = tmp_path / "extension.ts"
-    quiet_env = pi_mod.build_pi_launch_env({}, session_path, extension_path, verbose=False)
+    managed_bin = tmp_path / "bin"
+    quiet_env = pi_mod.build_pi_launch_env(
+        {"PATH": f"/usr/bin{pi_mod.os.pathsep}{managed_bin}"},
+        session_path,
+        extension_path,
+        verbose=False,
+        prepend_to_path=(managed_bin,),
+    )
     loud_env = pi_mod.build_pi_launch_env({}, session_path, extension_path, verbose=True)
     assert quiet_env[pi_mod.PI_SESSION_CONFIG_ENV] == str(session_path)
     assert quiet_env[pi_mod.PI_EXTENSION_PATH_ENV] == str(extension_path)
+    assert quiet_env["PATH"].split(pi_mod.os.pathsep)[0] == str(managed_bin)
+    assert quiet_env["PATH"].split(pi_mod.os.pathsep).count(str(managed_bin)) == 1
     assert pi_mod.PI_VERBOSE_ENV not in quiet_env
     assert loud_env[pi_mod.PI_EXTENSION_PATH_ENV] == str(extension_path)
     assert loud_env[pi_mod.PI_VERBOSE_ENV] == "1"

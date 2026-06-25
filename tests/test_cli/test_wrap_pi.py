@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -129,6 +130,7 @@ def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_e
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool", return_value=Path("/tmp/headroom/bin/rtk")),
         patch(
             "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
         ),
@@ -140,6 +142,7 @@ def test_wrap_pi_explicit_provider_builds_session_config_and_launches_with_one_e
     assert captured["command"][0] == "/fake/bin/pi"
     assert captured["command"].count("--extension") == 1
     assert captured["env"][PI_EXTENSION_PATH_ENV] == captured["command"][captured["command"].index("--extension") + 1]
+    assert captured["env"]["PATH"].split(os.pathsep)[0] == "/tmp/headroom/bin"
     assert captured["session_config"]["managedProviders"] == ["openai"]
     assert captured["session_config"]["providers"]["openai"]["ownership"] == "owned"
     assert "HEADROOM_PI_SESSION_CONFIG" in captured["extension_contents"]
@@ -171,6 +174,7 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool", return_value=Path("/tmp/headroom/bin/rtk")),
         patch(
             "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
         ),
@@ -184,14 +188,16 @@ def test_wrap_pi_without_provider_uses_lazy_auto_manage_and_skips_eager_proxy_st
         "openai": 8789,
         "anthropic": 8790,
         "github-copilot": 8788,
+        "xai": 8791,
     }
     assert captured["provider_variant_ports"] == {
-        "github-copilot": {"openai": 8788, "anthropic": 8791}
+        "github-copilot": {"openai": 8788, "anthropic": 8792}
     }
     assert captured["session_config"]["managedProviders"] == [
         "openai",
         "anthropic",
         "github-copilot",
+        "xai",
     ]
     assert captured["env"][PI_EXTENSION_PATH_ENV] == captured["command"][captured["command"].index("--extension") + 1]
     assert captured["session_config"]["providers"] == {}
@@ -227,6 +233,7 @@ def test_wrap_pi_explicit_copilot_session_config_eager_starts_only_openai_varian
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool", return_value=Path("/tmp/headroom/bin/rtk")),
         patch(
             "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
         ),
@@ -278,6 +285,7 @@ def test_wrap_pi_forwards_backend_and_memory_to_proxy_lifecycle(
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool", return_value=Path("/tmp/headroom/bin/rtk")),
         patch(
             "headroom.cli.wrap._start_pi_managed_proxies", side_effect=fake_start_pi_managed_proxies
         ),
@@ -342,6 +350,7 @@ def test_wrap_pi_rejects_user_supplied_extension_passthrough_before_proxy_start(
 
     with (
         patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool", return_value=Path("/tmp/headroom/bin/rtk")),
         patch("headroom.cli.wrap._start_pi_managed_proxies") as start_proxies,
     ):
         result = runner.invoke(main, ["wrap", "pi", "--", "--extension", "/tmp/user.ts"])
@@ -368,8 +377,48 @@ def test_wrap_pi_help_describes_supported_v1_contract(
     assert "anthropic" in result.output
     assert "github-copilot" in result.output
     assert "--port" in result.output
+    assert "--no-context-tool" in result.output
     assert "exactly one provider is managed" in result.output
     assert "lazy-manage only the current provider" in result.output
+
+
+def test_wrap_pi_no_context_tool_skips_context_tool_prelude(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+
+    with (
+        patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._prepare_pi_context_tool") as prepare_context_tool,
+        patch("headroom.cli.wrap._start_pi_managed_proxies", return_value=[]),
+        patch("headroom.cli.wrap.subprocess.Popen", return_value=_FakePiProcess()),
+    ):
+        result = runner.invoke(main, ["wrap", "pi", "--no-context-tool"])
+
+    assert result.exit_code == 0, result.output
+    prepare_context_tool.assert_not_called()
+
+
+def test_wrap_pi_context_tool_failure_aborts_before_launch(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+
+    with (
+        patch("headroom.cli.wrap._resolve_pi_binary", return_value="/fake/bin/pi"),
+        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None),
+        patch("headroom.cli.wrap._start_pi_managed_proxies") as start_proxies,
+        patch("headroom.cli.wrap.subprocess.Popen") as popen,
+    ):
+        result = runner.invoke(main, ["wrap", "pi", "--provider", "openai"])
+
+    assert result.exit_code == 1
+    assert "rtk install failed" in result.output
+    assert "--no-context-tool" in result.output
+    start_proxies.assert_not_called()
+    popen.assert_not_called()
 
 
 def test_build_pi_provider_variant_ports_skips_reserved_primary_ports(
@@ -378,9 +427,9 @@ def test_build_pi_provider_variant_ports_skips_reserved_primary_ports(
     wrap_cli, _main = wrap_modules
 
     assert wrap_cli._build_pi_provider_variant_ports(
-        ["openai", "anthropic", "github-copilot"],
-        {"openai": 8789, "anthropic": 8790, "github-copilot": 8788},
-    ) == {"github-copilot": {"openai": 8788, "anthropic": 8791}}
+        ["openai", "anthropic", "github-copilot", "xai"],
+        {"openai": 8789, "anthropic": 8790, "github-copilot": 8788, "xai": 8791},
+    ) == {"github-copilot": {"openai": 8788, "anthropic": 8792}}
 
 
 def test_start_proxy_suppresses_log_path_announcement_when_announce_false(

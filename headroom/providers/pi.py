@@ -406,18 +406,52 @@ def render_pi_extension(temp_dir: Path, session_config_path: Path) -> Path:
     return target
 
 
+def _prepend_path_entries(
+    env: dict[str, str],
+    entries: Sequence[str | os.PathLike[str]],
+) -> None:
+    """Prepend entries to PATH while preserving order and dropping duplicates."""
+
+    if not entries:
+        return
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        value = raw.strip()
+        if not value:
+            return
+        key = os.path.normcase(value) if os.name == "nt" else value
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(value)
+
+    for entry in entries:
+        add(os.fspath(entry))
+
+    existing_path = env.get("PATH", "")
+    for part in existing_path.split(os.pathsep):
+        add(part)
+
+    env["PATH"] = os.pathsep.join(ordered)
+
+
 def build_pi_launch_env(
     base_env: Mapping[str, str],
     session_config_path: Path,
     extension_path: Path,
     *,
     verbose: bool,
+    prepend_to_path: Sequence[str | os.PathLike[str]] = (),
 ) -> dict[str, str]:
     """Build the environment for a pi session-scoped extension launch."""
 
     env = dict(base_env)
     env[PI_SESSION_CONFIG_ENV] = str(session_config_path)
     env[PI_EXTENSION_PATH_ENV] = str(extension_path)
+    _prepend_path_entries(env, prepend_to_path)
     if verbose:
         env[PI_VERBOSE_ENV] = "1"
     else:

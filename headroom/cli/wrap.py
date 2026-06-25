@@ -1511,6 +1511,39 @@ def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Pat
     return _ensure_rtk_binary(verbose=verbose)
 
 
+def _prepare_pi_context_tool(verbose: bool = False) -> Path:
+    """Prepare the selected context tool for ``wrap pi`` and return its binary path.
+
+    Unlike hint-file based wrappers, ``wrap pi`` launches a child process with a
+    temporary session extension, so the selected context tool must exist on disk
+    and be reachable via the child process ``PATH``. Fail closed unless the user
+    explicitly opts out with ``--no-context-tool``.
+    """
+
+    selected_tool = _selected_context_tool()
+    if selected_tool == _CONTEXT_TOOL_LEAN_CTX:
+        click.echo("  Setting up lean-ctx for PI...")
+        lean_ctx_path = _setup_lean_ctx_agent("pi", verbose=verbose)
+        if lean_ctx_path:
+            return lean_ctx_path
+        click.echo(
+            "  Error: lean-ctx setup failed; refusing to launch PI without the selected "
+            "context tool. Re-run with --no-context-tool to skip it."
+        )
+        raise SystemExit(1)
+
+    click.echo("  Setting up rtk for PI...")
+    rtk_path = _ensure_rtk_binary(verbose=verbose)
+    if rtk_path:
+        return rtk_path
+    click.echo(
+        "  Error: rtk install failed; refusing to launch PI without the selected "
+        "context tool. Install rtk manually and re-run, or pass --no-context-tool "
+        "to skip it."
+    )
+    raise SystemExit(1)
+
+
 # Canonical casing for the proxy's per-project savings header (matched
 # case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
 _PROJECT_HEADER_NAME = "X-Headroom-Project"
@@ -5759,6 +5792,12 @@ def _start_pi_managed_proxies(
     is_flag=True,
     help="Enable memory uniformly across wrapper-owned pi proxies in this session.",
 )
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    is_flag=True,
+    help="Skip RTK / lean-ctx setup for this pi session.",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
 def pi(
@@ -5766,6 +5805,7 @@ def pi(
     port: int | None,
     backend: str | None,
     memory: bool,
+    no_context_tool: bool,
     verbose: bool,
     pi_args: tuple[str, ...],
 ) -> None:
@@ -5775,9 +5815,10 @@ def pi(
     persistent config. v1 manages only `openai`, `anthropic`, and `github-copilot`; omit
     `--provider` to lazy-manage only the current provider on demand, and use `--port` only when
     exactly one provider is managed.
-    Existing compatible proxies are attached instead of restarted, and user-supplied pi
+    Existing compatible proxies are attached instead of restarted, user-supplied pi
     `--extension` arguments remain rejected in v1 because deterministic conflict ordering is not
-    yet part of the supported contract.
+    yet part of the supported contract, and the selected CLI context tool is prepared eagerly
+    unless `--no-context-tool` is passed.
     """
 
     pi_binary = _resolve_pi_binary()
@@ -5786,6 +5827,11 @@ def pi(
     provider_variant_ports = _build_pi_provider_variant_ports(managed_providers, provider_ports)
     resolved_backend = _resolve_pi_proxy_backend(backend)
     provider_variant_backends = _build_pi_provider_variant_backends(resolved_backend)
+    context_tool_path: Path | None = None
+    if no_context_tool:
+        click.echo("  Skipping CLI context tool (--no-context-tool)")
+    else:
+        context_tool_path = _prepare_pi_context_tool(verbose=verbose)
     proxies: list[_PiManagedProxy] = []
     pi_process: subprocess.Popen[Any] | None = None
     control_server: _PiWrapControlServer | None = None
@@ -5868,6 +5914,7 @@ def pi(
                 session_config_path,
                 extension_path,
                 verbose=verbose,
+                prepend_to_path=(context_tool_path.parent,) if context_tool_path else (),
             )
 
             _print_wrap_banner("pi")
